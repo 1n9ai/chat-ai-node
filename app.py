@@ -1591,6 +1591,13 @@ def admin_status():
     }
 
 
+@app.get("/api/admin/license/key")
+def license_key_reveal():
+    """license key ที่เครื่องนี้ใช้อยู่ (ต้องล็อกอิน) — ให้ผู้ใช้เก็บไว้หรือนำไปใส่ในแอป 1n9 ตัวอื่น"""
+    _, lic = _central(check=False)
+    return {"license_key": lic}
+
+
 @app.post("/api/admin/license/claim")
 def claim_license():
     """ย้าย license กลับมาใช้ที่เครื่องนี้ (admin กดเอง) — เครื่องอื่นที่ใช้อยู่จะถูกตัดแทน

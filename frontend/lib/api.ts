@@ -458,3 +458,5 @@ export const login = (username: string, password: string) =>
   request<{ ok: true }>("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
 export const logout = () => request<{ ok: true }>("/api/auth/logout", { method: "POST" });
 export const getPublicStatus = () => request<{ configured: boolean }>("/api/public/status");
+
+export const getLicenseKey = () => request<{ license_key: string }>("/api/admin/license/key");

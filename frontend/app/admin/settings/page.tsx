@@ -55,6 +55,7 @@ import type {
   SecretMask,
   VectorType,
 } from "@/lib/types";
+import { LicenseKeyReveal } from "@/components/LicenseKeyReveal";
 import { useI18n } from "@/lib/i18n";
 
 type T = ReturnType<typeof useI18n>["t"];
@@ -939,6 +940,7 @@ export default function SettingsPage() {
               onEdit={() => setEditingInfra("central")}
             />
           </div>
+          <LicenseKeyReveal />
         </Panel>
       </div>
 

@@ -72,7 +72,7 @@
     }
   },
   "errors": {
-    "demo_used": "This machine or email has already used the trial. Subscribe to continue with the same key.",
+    "demo_used": "This email or machine has already received a free license. Open Settings in the 1n9 app you installed first and copy the key from \"License key in use\", then enter it here (one license works on one system at a time). Lost it? Contact hello@1n9ai.com.",
     "credential_invalid": "The API key is invalid or lacks permission. Check that you copied all of it.",
     "provider_quota_exhausted": "The API key is out of quota or credit.",
     "central_unreachable": "Can't reach central. Check your internet connection.",
@@ -346,6 +346,16 @@
       "central_title": "Central and license",
       "central_subtitle": "Central processing service",
       "address": "Address"
+    },
+    "license_reveal": {
+      "title": "License key in use",
+      "show": "Show",
+      "hide": "Hide",
+      "copy": "Copy",
+      "copied": "Copied",
+      "none": "(no license yet)",
+      "failed": "Could not read the license key. Sign in again and retry.",
+      "note": "Keep this key. One license works on one installed system at a time: using it in another 1n9 app moves it there."
     }
   },
   "skills": {
