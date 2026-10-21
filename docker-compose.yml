@@ -1,0 +1,32 @@
+services:
+  node:
+    build: .
+    image: rag-node:latest
+    container_name: rag-node
+    # key ของลูกค้าทั้งหมด + CENTRAL_URL + LICENSE_KEY + NODE_PASSWORD
+    env_file: .env
+    ports:
+      # ค่าเริ่มต้นเปิดเฉพาะเครื่องตัวเอง — ถ้าจะให้เครื่องอื่นเข้าได้ ตั้ง NODE_BIND=0.0.0.0 · พอร์ตเปลี่ยนได้ที่ NODE_PORT
+      - "${NODE_BIND:-127.0.0.1}:${NODE_PORT:-8080}:8080"
+    environment:
+      # ค่าเริ่มต้นตอนเปิดครั้งแรก: เก็บเอกสารใน Qdrant ข้างล่าง (central เข้าผ่านท่อที่ node เปิดเอง ไม่ต้องเปิดพอร์ต)
+      VECTOR_TYPE: ${VECTOR_TYPE:-}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+    volumes:
+      # state.json, ไฟล์ต้นฉบับ, ไฟล์ export — อยู่รอดข้ามการ rebuild/restart
+      - node-data:/app/data
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+  # ฐานข้อมูลเอกสาร (vector) ในเครื่องนี้ — ไม่เปิดพอร์ตออกนอก มีแค่ node ที่คุยได้
+  qdrant:
+    image: qdrant/qdrant:v1.19.2
+    container_name: rag-qdrant
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  node-data:
+  qdrant-data:

@@ -1,0 +1,19 @@
+# key และข้อมูลจริง — ห้าม commit
+.env
+data/
+
+__pycache__/
+*.pyc
+.venv/
+*.log
+.DS_Store
+Thumbs.db
+
+# frontend build
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/tsconfig.tsbuildinfo
+
+# ผลลัพธ์ build ของ Windows
+packaging/windows/dist/

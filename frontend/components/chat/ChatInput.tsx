@@ -1,0 +1,192 @@
+"use client";
+
+import { useEffect, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
+import { Loader2, Mic, Paperclip, Send, Square, X } from "lucide-react";
+import { startRecording, voiceSupported, type Recorder } from "@/lib/voice";
+
+const ALLOWED_FILE_TYPES = ["image/jpeg", "image/jpg", "image/png", "image/webp", "application/pdf"];
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB — จำกัดให้เบา (ระบบ demo)
+const MAX_RECORD_SECONDS = 120;
+
+type VoiceState = "idle" | "recording" | "transcribing";
+
+export function ChatInput({
+  onSend,
+  onTranscribe,
+  disabled,
+}: {
+  onSend: (message: string, file: File | null) => void;
+  // ไม่ส่งมา = บอทนี้ไม่มีโมเดลถอดเสียง → ซ่อนปุ่มไมค์
+  onTranscribe?: (audio: Blob) => Promise<string>;
+  disabled?: boolean;
+}) {
+  const [value, setValue] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [voice, setVoice] = useState<VoiceState>("idle");
+  const [seconds, setSeconds] = useState(0);
+  const [canRecord, setCanRecord] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const recorderRef = useRef<Recorder | null>(null);
+
+  useEffect(() => setCanRecord(voiceSupported()), []);
+  useEffect(() => () => recorderRef.current?.cancel(), []);
+
+  useEffect(() => {
+    if (voice !== "recording") return;
+    const timer = setInterval(() => setSeconds((s) => s + 1), 1000);
+    return () => clearInterval(timer);
+  }, [voice]);
+
+  useEffect(() => {
+    if (voice === "recording" && seconds >= MAX_RECORD_SECONDS) stopRecording();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seconds, voice]);
+
+  async function beginRecording() {
+    setFileError(null);
+    try {
+      recorderRef.current = await startRecording();
+      setSeconds(0);
+      setVoice("recording");
+    } catch {
+      setFileError("เปิดไมโครโฟนไม่ได้ — อนุญาตการใช้ไมค์ในเบราว์เซอร์ก่อน (ต้องเปิดผ่าน https หรือ localhost)");
+    }
+  }
+
+  async function stopRecording() {
+    const rec = recorderRef.current;
+    if (!rec || !onTranscribe) return;
+    recorderRef.current = null;
+    setVoice("transcribing");
+    try {
+      const text = (await onTranscribe(await rec.stop())).trim();
+      if (text) setValue((v) => (v.trim() ? `${v.trimEnd()} ${text}` : text));
+      else setFileError("ไม่ได้ยินเสียงพูด ลองอัดใหม่อีกครั้ง");
+    } catch (e) {
+      setFileError(`ถอดเสียงไม่สำเร็จ: ${e instanceof Error ? e.message : "unknown error"}`);
+    } finally {
+      setVoice("idle");
+    }
+  }
+
+  function submit() {
+    const trimmed = value.trim();
+    if (!trimmed || disabled) return;
+    onSend(trimmed, file);
+    setValue("");
+    setFile(null);
+    setFileError(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      submit();
+    }
+  }
+
+  function handleFileChange(e: ChangeEvent<HTMLInputElement>) {
+    const picked = e.target.files?.[0] ?? null;
+    if (!picked) return;
+
+    if (!ALLOWED_FILE_TYPES.includes(picked.type)) {
+      setFileError("รองรับเฉพาะไฟล์รูปภาพ JPEG/PNG/WEBP หรือ PDF เท่านั้น");
+      setFile(null);
+      return;
+    }
+    if (picked.size > MAX_FILE_SIZE) {
+      setFileError(`ไฟล์ใหญ่เกินไป (จำกัด ${MAX_FILE_SIZE / (1024 * 1024)}MB)`);
+      setFile(null);
+      return;
+    }
+
+    setFileError(null);
+    setFile(picked);
+  }
+
+  function removeFile() {
+    setFile(null);
+    setFileError(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  return (
+    <div className="flex flex-col gap-2 bg-white p-3">
+      {(file || fileError) && (
+        <div className="flex items-center gap-2 text-xs">
+          {file && (
+            <span className="flex items-center gap-1.5 rounded-full bg-brand-50 px-2.5 py-1 font-medium text-brand-700 ring-1 ring-inset ring-brand-200">
+              <Paperclip size={11} /> {file.name}
+              <button type="button" onClick={removeFile} aria-label="เอาไฟล์แนบออก" className="text-brand-500 hover:text-brand-800">
+                <X size={12} />
+              </button>
+            </span>
+          )}
+          {fileError && <span className="text-rose-600">{fileError}</span>}
+        </div>
+      )}
+
+      <div className="flex items-end gap-2">
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept={ALLOWED_FILE_TYPES.join(",")}
+          onChange={handleFileChange}
+          className="hidden"
+          disabled={disabled}
+        />
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={disabled}
+          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-slate-200 text-slate-500 transition-colors hover:bg-slate-50 disabled:opacity-50"
+          aria-label="แนบไฟล์รูปภาพหรือ PDF"
+        >
+          <Paperclip size={16} />
+        </button>
+        <textarea
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={handleKeyDown}
+          disabled={disabled || voice !== "idle"}
+          rows={1}
+          placeholder={
+            voice === "recording"
+              ? `กำลังฟัง... ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")} (กดปุ่มหยุดเมื่อพูดจบ)`
+              : voice === "transcribing"
+                ? "กำลังถอดเสียง..."
+                : "พิมพ์คำถาม... (Enter เพื่อส่ง)"
+          }
+          className="max-h-32 flex-1 resize-none rounded-xl border border-accent-200 bg-accent-50/60 px-3.5 py-2.5 text-sm focus:border-brand-400 focus:bg-white focus:outline-none focus:ring-4 focus:ring-brand-400/15 disabled:bg-slate-50"
+        />
+        {onTranscribe && canRecord && (
+          <button
+            type="button"
+            onClick={voice === "recording" ? stopRecording : beginRecording}
+            disabled={disabled || voice === "transcribing"}
+            className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border transition-colors disabled:opacity-50 ${
+              voice === "recording"
+                ? "animate-pulse border-rose-300 bg-rose-50 text-rose-600"
+                : "border-slate-200 text-slate-500 hover:bg-slate-50"
+            }`}
+            aria-label={voice === "recording" ? "หยุดอัดเสียงและถอดเป็นข้อความ" : "พูดแทนการพิมพ์"}
+            title={voice === "recording" ? "หยุดอัดเสียง" : "พูดแทนการพิมพ์"}
+          >
+            {voice === "transcribing" ? <Loader2 size={16} className="animate-spin" /> : voice === "recording" ? <Square size={14} className="fill-current" /> : <Mic size={16} />}
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={submit}
+          disabled={disabled || voice !== "idle" || !value.trim()}
+          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-brand-600 bg-brand-grad text-white shadow-brand transition-all hover:shadow-glow disabled:bg-accent-200 disabled:bg-none disabled:text-white disabled:shadow-none"
+          aria-label="Send message"
+        >
+          <Send size={16} />
+        </button>
+      </div>
+    </div>
+  );
+}

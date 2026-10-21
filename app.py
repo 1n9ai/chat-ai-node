@@ -1,0 +1,3249 @@
+"""node/app.py — เครื่องลูกค้า (node) แบบบาง
+
+หน้าที่:
+- เก็บการตั้งค่า (provider / key / โมเดล ของ LLM, embedding, rerank, Qdrant, central) ใน SQLite —
+  key เข้ารหัสด้วย Fernet, แก้จากหน้า Settings แล้วมีผลทันทีโดยไม่ต้องรีสตาร์ต
+- เก็บสถานะ (KB, ชุดสูตร, บอท, cache, export, usage) ใน SQLite ไฟล์เดียว (data/node.db)
+- ส่งงานทั้งหมดให้ central ประมวลผล (central ไม่เก็บอะไรของลูกค้า)
+- เสิร์ฟหน้าเว็บ (frontend/out — Next.js static export): หน้าแชทที่ / และหลังบ้านที่ /admin
+
+.env ใช้แค่ค่าตอนติดตั้ง: ค่าเริ่มต้นของ Settings ครั้งแรก, NODE_PASSWORD, NODE_SECRET_KEY (ไม่บังคับ)
+"""
+
+from __future__ import annotations
+
+import base64
+import csv
+import hashlib
+import hmac
+import io
+import ipaddress
+import json
+import os
+import re
+import secrets
+import socket
+import sqlite3
+import ssl
+import threading
+import time
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import quote, urlparse
+
+import httpx
+from tunnel_client import TunnelClient
+import line_channel
+from cryptography.fernet import Fernet, InvalidToken
+from dotenv import load_dotenv
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
+
+DATA_DIR = Path(os.environ.get("NODE_DATA_DIR") or ROOT / "data")
+DB_FILE = DATA_DIR / "node.db"
+LEGACY_STATE_FILE = DATA_DIR / "state.json"
+SECRET_KEY_FILE = DATA_DIR / "secret.key"
+# รหัสเครื่องนี้ (สุ่มครั้งแรกครั้งเดียว) — central ใช้ผูก license กับเครื่องล่าสุดที่ใช้ (กันแชร์ key)
+INSTALL_ID_FILE = DATA_DIR / "install_id"
+ORIGINALS_DIR = DATA_DIR / "originals"
+EXPORTS_DIR = DATA_DIR / "exports"
+FRONTEND_DIR = Path(os.environ.get("NODE_FRONTEND_DIR") or ROOT / "frontend" / "out")
+
+NODE_USER = os.environ.get("NODE_USER", "admin")
+NODE_PASSWORD = os.environ.get("NODE_PASSWORD", "")
+# all = ล็อกทุกหน้า (ค่าเริ่มต้น) · admin = ล็อกเฉพาะหลังบ้าน (/admin, /api/admin) ให้หน้าเว็บสาธารณะใช้ API ได้
+NODE_AUTH_SCOPE = os.environ.get("NODE_AUTH_SCOPE", "admin").strip().lower()
+
+KB_ALLOWED = [".pdf", ".txt", ".docx", ".csv", ".xlsx"]
+QUICK_CHAT_MAX_TAGS = 5
+QUICK_CHAT_MAX_TAG_LENGTH = 100
+
+# ค่าเดียวกับ bot_store.py เดิม — ใช้เมื่อสร้างบอทโดยไม่ระบุ system prompt
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful AI assistant. Use the provided Context (Knowledge Base) as your primary source "
+    "and follow it when it conflicts with general knowledge.\n\n"
+    "If the Context does not cover what the user needs, answer from your general knowledge instead of "
+    "refusing, and say which parts come from the Context and which do not. State any assumptions you make.\n\n"
+    "Never invent facts that exist only in the user's own documents (their records, figures, names, terms). "
+    "If those are missing, say that no information was found in the knowledge base and what you looked for, "
+    "then help in general terms where you can.\n\n"
+    "This overrides any later instruction to answer \"no data found\": that applies only to facts specific "
+    "to the user's documents, not to methods, definitions, or advice.\n\n"
+    "Answer in the same language as the question."
+)
+
+TIMEOUT = httpx.Timeout(connect=15, read=900, write=120, pool=15)
+
+app = FastAPI(title="RAG Node", docs_url=None, redoc_url=None, openapi_url=None)
+
+
+# ══════════════════════════════════════════════
+# Basic Auth (เปิดเมื่อตั้ง NODE_PASSWORD เท่านั้น — ระบบ login จริงมาในขั้นถัดไป)
+# ══════════════════════════════════════════════
+
+def _hash_password(pw: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200_000).hex()
+    return f"pbkdf2_sha256$200000${salt}${digest}"
+
+
+def _check_password(pw: str, stored: str) -> bool:
+    try:
+        _, rounds, salt, digest = stored.split("$")
+        got = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), int(rounds)).hex()
+        return secrets.compare_digest(got, digest)
+    except (ValueError, TypeError):
+        return False
+
+
+def _stored_password_hash() -> str:
+    try:
+        return (load_settings().get("setup") or {}).get("password_hash") or ""
+    except Exception:  # ฐานข้อมูลยังไม่พร้อม (ก่อน startup) — ยังไม่มีรหัส
+        return ""
+
+
+# เส้นทางที่ยืนยันตัวตนเอง (ลายเซ็นของ LINE) — ไม่ใช้รหัสผ่านแอดมิน ไม่ว่าจะตั้ง scope แบบไหน
+_SELF_AUTH_PREFIXES = ("/api/channels/",)
+# scope=admin: สิ่งที่หน้าแชทสาธารณะต้องใช้เท่านั้น — นอกนั้นใต้ /api/ ต้องเข้าสู่ระบบ
+_PUBLIC_API = (
+    ("GET", re.compile(r"^/api/bots/?$")),
+    ("GET", re.compile(r"^/api/bots/[\w-]+/?$")),
+    ("POST", re.compile(r"^/api/bots/[\w-]+/(chat|chat/stream|transcribe)/?$")),
+    ("GET", re.compile(r"^/api/exports/[\w-]+/download/?$")),
+)
+
+
+# หน้า login, ไฟล์หน้าเว็บที่ไม่มีข้อมูล และสถานะสาธารณะ (แค่ "ตั้งค่าครบหรือยัง") เปิดเสมอ
+_OPEN_PREFIXES = ("/login", "/api/auth/", "/api/public/", "/_next/", "/brand/", "/icon.png", "/apple-icon.png", "/favicon")
+
+
+def _needs_password(method: str, path: str) -> bool:
+    if path == "/healthz" or path.startswith(_SELF_AUTH_PREFIXES) or path.startswith(_OPEN_PREFIXES):
+        return False
+    if NODE_AUTH_SCOPE != "admin":
+        return True
+    if re.match(r"^/(admin|kb)(/|$)", path):  # หน้าหลังบ้าน (หน้าจัดการ KB อยู่ที่ /kb)
+        return True
+    if path.startswith("/api/"):
+        return not any(m == method and rx.match(path) for m, rx in _PUBLIC_API)
+    return False
+
+
+# ชื่อโดเมนที่ใช้เปิด node ได้ (นอกจาก localhost และ IP ตรง ๆ) — เช่นเปิดผ่าน nginx ด้วยโดเมนของบริษัท
+_ALLOWED_HOSTS = {h.strip().lower() for h in os.environ.get("NODE_ALLOWED_HOSTS", "").split(",") if h.strip()}
+# หน้าเว็บที่อยู่คนละโดเมนกับ node แต่ให้เรียก API ได้ (CORS) — เช่นหน้าเว็บระบบเดิมที่ชี้มาที่ api.<โดเมน>
+_CORS_ORIGINS = [o.strip().rstrip("/") for o in os.environ.get("NODE_CORS_ORIGINS", "").split(",") if o.strip()]
+_IP_HOST = re.compile(r"^(\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:.]+\])$")
+
+
+def _host_only(value: str) -> str:
+    value = value.strip().lower()
+    if value.startswith("["):
+        return value.split("]")[0] + "]"
+    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
+
+
+def _host_allowed(host: str) -> bool:
+    """กัน DNS rebinding: เว็บร้ายชี้โดเมนของมันมาที่ 127.0.0.1 แล้วเรียก node ผ่านเบราว์เซอร์ของผู้ใช้
+    โดเมนแบบนั้นจะมาใน Host header — รับเฉพาะ localhost, IP ตรง ๆ และโดเมนที่ตั้งใน NODE_ALLOWED_HOSTS"""
+    h = _host_only(host)
+    return not h or h in ("localhost", "testserver") or h.endswith(".localhost") or bool(_IP_HOST.match(h)) \
+        or h in _ALLOWED_HOSTS or "*" in _ALLOWED_HOSTS
+
+
+@app.middleware("http")
+async def same_origin_guard(request: Request, call_next):
+    """กันเว็บอื่นสั่งงาน node ผ่านเบราว์เซอร์ของผู้ใช้ (node มักไม่มีรหัสผ่านตอนเปิดในเครื่องตัวเอง)"""
+    path = request.url.path
+    if path == "/healthz" or path.startswith(_SELF_AUTH_PREFIXES):
+        return await call_next(request)
+    host = request.headers.get("host", "")
+    if not _host_allowed(host):
+        return Response("host not allowed — add it to NODE_ALLOWED_HOSTS", status_code=403)
+    origin = request.headers.get("origin")
+    if origin and origin.rstrip("/") in _CORS_ORIGINS:
+        return await call_next(request)
+    if request.method not in ("GET", "HEAD", "OPTIONS") and origin and origin != "null":
+        if origin.split("://", 1)[-1].rstrip("/").lower() != host.strip().lower():  # ต้องตรงทั้งโดเมนและพอร์ต
+            return Response("cross-origin request blocked", status_code=403)
+    elif request.method not in ("GET", "HEAD", "OPTIONS") and origin == "null":
+        return Response("cross-origin request blocked", status_code=403)
+    return await call_next(request)
+
+
+# ══════════════════════════════════════════════
+# เข้าสู่ระบบ: หน้า login (session cookie) + Basic Auth สำหรับสคริปต์/API (เปิดเมื่อมีรหัสผ่านแล้วเท่านั้น)
+# รหัสผ่านมาจาก NODE_PASSWORD (ไฟล์ตั้งค่า) หรือที่ตั้งในหน้าตั้งค่าครั้งแรก (เก็บแบบ hash)
+# ยังไม่มีรหัสเลย = ไม่ล็อก (เครื่องของตัวเอง) — หน้าตั้งค่าครั้งแรกจะให้ตั้งรหัสเป็นขั้นแรก
+# ══════════════════════════════════════════════
+
+SESSION_COOKIE = "n_session"
+SESSION_TTL = 7 * 24 * 3600
+_LOGIN_FAILS: dict[str, list[float]] = {}
+_LOGIN_MAX, _LOGIN_WINDOW = 8, 600  # ผิดได้ 8 ครั้ง / 10 นาที ต่อ IP
+
+
+def _credentials_set() -> bool:
+    return bool(NODE_PASSWORD or _stored_password_hash())
+
+
+def _password_mark() -> str:
+    """เปลี่ยนรหัสผ่านแล้ว session เก่าต้องใช้ไม่ได้ — ผูกลายเซ็นกับรหัสปัจจุบัน"""
+    return hashlib.sha256((NODE_PASSWORD or _stored_password_hash()).encode()).hexdigest()[:16]
+
+
+def _sign(payload: str) -> str:
+    key = hashlib.sha256(b"session|" + _secret_text().encode()).digest()
+    return hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
+
+
+def _make_session() -> str:
+    exp = int(time.time()) + SESSION_TTL
+    payload = f"{exp}|{_password_mark()}"
+    return f"{payload}|{_sign(payload)}"
+
+
+def _session_ok(token: str) -> bool:
+    try:
+        exp, mark, sig = token.split("|")
+        return int(exp) > time.time() and secrets.compare_digest(mark, _password_mark()) and secrets.compare_digest(sig, _sign(f"{exp}|{mark}"))
+    except (ValueError, AttributeError):
+        return False
+
+
+def _basic_ok(header: str) -> bool:
+    if not header.lower().startswith("basic "):
+        return False
+    try:
+        user, _, pw = base64.b64decode(header[6:]).decode().partition(":")
+    except Exception:
+        return False
+    stored = "" if NODE_PASSWORD else _stored_password_hash()
+    return secrets.compare_digest(user, NODE_USER) and (
+        secrets.compare_digest(pw, NODE_PASSWORD) if NODE_PASSWORD else bool(stored) and _check_password(pw, stored))
+
+
+def _authed(request: Request) -> bool:
+    return _session_ok(request.cookies.get(SESSION_COOKIE, "")) or _basic_ok(request.headers.get("authorization", ""))
+
+
+def _set_session_cookie(response: Response, request: Request) -> None:
+    secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").lower() == "https"
+    response.set_cookie(SESSION_COOKIE, _make_session(), max_age=SESSION_TTL, httponly=True, samesite="lax", secure=secure, path="/")
+
+
+def _client_ip(request: Request) -> str:
+    return request.headers.get("x-real-ip") or (request.client.host if request.client else "?")
+
+
+@app.middleware("http")
+async def auth_gate(request: Request, call_next):
+    path = request.url.path
+    if _credentials_set() and _needs_password(request.method, path) and not _authed(request):
+        if path.startswith("/api/"):
+            # ไม่ส่ง WWW-Authenticate กลับ เพื่อไม่ให้เบราว์เซอร์เด้งกล่องรหัสผ่านทับหน้า login (สคริปต์ที่ส่ง Basic มาเองยังใช้ได้)
+            return JSONResponse({"detail": "[login_required] Sign in required"}, status_code=401)
+        return RedirectResponse("/login/?next=" + quote(path), status_code=302)
+    return await call_next(request)
+
+
+@app.post("/api/auth/login")
+async def auth_login(request: Request, body: dict = Body(...)):
+    ip = _client_ip(request)
+    now = time.time()
+    fails = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < _LOGIN_WINDOW]
+    if len(fails) >= _LOGIN_MAX:
+        raise HTTPException(429, "[login_rate_limited] Too many attempts. Try again in a few minutes.")
+    user, pw = str(body.get("username") or ""), str(body.get("password") or "")
+    stored = "" if NODE_PASSWORD else _stored_password_hash()
+    ok = _credentials_set() and secrets.compare_digest(user, NODE_USER) and (
+        secrets.compare_digest(pw, NODE_PASSWORD) if NODE_PASSWORD else _check_password(pw, stored))
+    if not ok:
+        _LOGIN_FAILS[ip] = fails + [now]
+        raise HTTPException(401, "[login_invalid] Wrong username or password")
+    _LOGIN_FAILS.pop(ip, None)
+    resp = JSONResponse({"ok": True})
+    _set_session_cookie(resp, request)
+    return resp
+
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(SESSION_COOKIE, path="/")
+    return resp
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    required = _credentials_set()
+    return {"auth_required": required, "authenticated": (not required) or _authed(request), "user": NODE_USER if required else None}
+
+
+@app.middleware("http")
+async def no_cache_html(request: Request, call_next):
+    """ห้ามเบราว์เซอร์จำหน้า HTML/API — ไม่งั้นหลังอัปเดตเวอร์ชันจะยังเห็นหน้าเก่าจนกว่าจะกด Ctrl+F5
+    (ไฟล์ใน /_next/static มีชื่อเปลี่ยนทุก build อยู่แล้ว จึง cache ได้ตามปกติ)"""
+    static_asset = request.url.path.startswith("/_next/static/")
+    if not static_asset:
+        # ตัด header ขอ 304 ทิ้ง — StaticFiles ตัดสิน "ไม่เปลี่ยน" จากเวลาไฟล์ ซึ่งผิดได้กับไฟล์ที่ build ใน
+        # Docker (เคยเจอ: เบราว์เซอร์ได้ 304 แล้วแสดงหน้า /chat/ รุ่นเก่าค้าง แม้กดรีเฟรช)
+        request.scope["headers"] = [
+            (k, v) for k, v in request.scope["headers"] if k not in (b"if-none-match", b"if-modified-since")
+        ]
+    response = await call_next(request)
+    if not static_asset:
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
+
+
+# ══════════════════════════════════════════════
+# SQLite — เก็บแต่ละรายการเป็น JSON ต่อแถว (ตารางละประเภท)
+# ══════════════════════════════════════════════
+
+_TABLES = ("kbs", "skills", "bots", "caches", "exports", "sources", "channels", "api_keys",
+           # ตารางของรุ่นก่อน — สร้างไว้เสมอก็ไม่เสียหาย
+           "ocr_jobs", "screening_jobs", "screening_candidates", "screening_templates", "pharmacy")
+_db_lock = threading.RLock()
+
+
+@contextmanager
+def _db():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_FILE, timeout=15)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db() -> None:
+    with _db_lock, _db() as c:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        for t in _TABLES:
+            c.execute(f"CREATE TABLE IF NOT EXISTS {t} (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
+        c.execute("CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL)")
+
+
+def db_all(table: str) -> list[dict]:
+    with _db() as c:
+        return [json.loads(r[0]) for r in c.execute(f"SELECT data FROM {table} ORDER BY rowid")]
+
+
+def db_get(table: str, item_id: str) -> dict | None:
+    with _db() as c:
+        row = c.execute(f"SELECT data FROM {table} WHERE id=?", (item_id,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def db_put(table: str, item_id: str, obj: dict) -> None:
+    with _db_lock, _db() as c:
+        c.execute(
+            f"INSERT INTO {table} (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+            (item_id, json.dumps(obj, ensure_ascii=False)),
+        )
+
+
+def db_delete(table: str, item_id: str) -> None:
+    with _db_lock, _db() as c:
+        c.execute(f"DELETE FROM {table} WHERE id=?", (item_id,))
+
+
+_USAGE_ZERO = {"llm_input_tokens": 0, "llm_output_tokens": 0, "llm_calls": 0,
+               "embed_tokens": 0, "embed_calls": 0, "rerank_calls": 0, "stt_calls": 0, "stt_seconds": 0.0,
+               "requests": 0}
+
+
+def get_usage() -> dict:
+    with _db() as c:
+        row = c.execute("SELECT data FROM usage WHERE id=1").fetchone()
+    return {**_USAGE_ZERO, **(json.loads(row[0]) if row else {})}
+
+
+def add_usage(usage: dict | None) -> None:
+    if not usage:
+        return
+    with _db_lock:
+        u = get_usage()
+        llm, emb, rr = usage.get("llm") or {}, usage.get("embedding") or {}, usage.get("rerank") or {}
+        u["llm_input_tokens"] += int(llm.get("input_tokens") or 0)
+        u["llm_output_tokens"] += int(llm.get("output_tokens") or 0)
+        u["llm_calls"] += int(llm.get("calls") or 0)
+        u["embed_tokens"] += int(emb.get("tokens") or 0)
+        u["embed_calls"] += int(emb.get("calls") or 0)
+        u["rerank_calls"] += int(rr.get("calls") or 0)
+        stt = usage.get("stt") or {}
+        u["stt_calls"] += int(stt.get("calls") or 0)
+        u["stt_seconds"] = round(u["stt_seconds"] + float(stt.get("audio_seconds") or 0), 2)
+        u["requests"] += 1
+        with _db() as c:
+            c.execute("INSERT INTO usage (id, data) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                      (json.dumps(u),))
+
+
+def migrate_legacy_state() -> None:
+    """ย้ายข้อมูลจาก state.json (รุ่นก่อน) เข้า SQLite ครั้งเดียว แล้วเปลี่ยนชื่อไฟล์เดิมเก็บไว้"""
+    if not LEGACY_STATE_FILE.exists() or db_all("kbs") or db_all("bots"):
+        return
+    state = json.loads(LEGACY_STATE_FILE.read_text(encoding="utf-8"))
+    for table in _TABLES:
+        for item_id, obj in (state.get(table) or {}).items():
+            db_put(table, item_id, obj)
+    if state.get("usage"):
+        with _db() as c:
+            c.execute("INSERT OR REPLACE INTO usage (id, data) VALUES (1, ?)", (json.dumps(state["usage"]),))
+    LEGACY_STATE_FILE.rename(LEGACY_STATE_FILE.with_suffix(".json.migrated"))
+
+
+# ══════════════════════════════════════════════
+# Settings — การเชื่อมต่อ + คลังโมเดล (key เข้ารหัส, แก้จากหน้าเว็บ, มีผลทันที)
+# ══════════════════════════════════════════════
+#
+# providers  = การเชื่อมต่อที่ผู้ใช้เพิ่มเอง {id: {name, type, base_url, api_key}}
+# registry   = คลังโมเดล {id: {name, kind (llm|embedding|rerank|stt), provider, model, dim?}} — เพิ่มได้หลายตัวต่อประเภท
+# defaults   = ค่าเริ่มต้นต่อประเภท {llm: id, embedding: id, rerank: id, stt: id}
+# stt (ถอดเสียง) ไม่บังคับ — ถ้าไม่มี ใช้ LLM ของบอทถอดแทนได้เมื่อเป็น Gemini
+# การเลือกใช้จริงอยู่ที่งาน: KB เลือก embedding ตอนสร้าง (ผูกถาวร), บอทเลือก LLM/rerank (ว่าง = ค่าเริ่มต้น)
+
+# setup = สถานะหน้าตั้งค่าครั้งแรก + hash รหัสผ่านหลังบ้าน (ตั้งจากหน้าเว็บ ใช้เมื่อไม่ได้ตั้ง NODE_PASSWORD)
+SECTIONS = ("providers", "registry", "defaults", "vector", "central", "setup")
+# vector database ที่เก็บเอกสารของ KB — pgvector เก็บ connection string ไว้ในช่อง api_key (มีรหัสผ่านอยู่ข้างใน
+# จึงต้องเข้ารหัสและซ่อนแบบเดียวกับ key อื่น) ส่วน Pinecone ใช้แค่ API key
+# local = Qdrant ในเครื่องนี้ (หรือใน LAN) — central คุยผ่านท่อที่ node เปิดออกไป ไม่ต้องเปิดพอร์ต/สมัครคลาวด์
+VECTOR_TYPES = ("local", "qdrant", "pgvector", "pinecone")
+LEGACY_SECTIONS = ("llm", "embedding", "rerank", "models")
+KINDS = ("llm", "embedding", "rerank", "stt")
+LEGACY_KINDS = ("llm", "embedding", "rerank")  # การตั้งค่ารุ่นแรก (ยังไม่มี stt)
+KIND_LABEL = {"llm": "LLM", "embedding": "Embedding", "rerank": "Rerank", "stt": "Speech-to-Text"}
+SECRET_FIELDS = {"api_key", "license_key"}
+_settings_cache: dict | None = None
+
+# รูปแบบ API ที่ระบบคุยได้ (ระบบเดาจาก URL ให้เอง) — ผู้ให้บริการแทบทุกเจ้าใช้แบบ OpenAI ได้
+PROTOCOLS: dict[str, dict] = {
+    "openai_compatible": {"label": "OpenAI-compatible API"},
+    "google": {"label": "Google Gemini API"},
+    "ollama": {"label": "Ollama"},
+}
+
+# สำหรับแปลงการตั้งค่ารุ่นแรก ๆ ที่ผูก id ตายตัว
+_LEGACY_PROVIDERS = {
+    "google": ("Google Gemini", "google", ""),
+    "openai": ("OpenAI", "openai_compatible", "https://api.openai.com/v1"),
+    "siliconflow": ("SiliconFlow", "openai_compatible", "https://api.siliconflow.com/v1"),
+    "ollama": ("Ollama", "ollama", ""),
+    "custom": ("OpenAI-compatible", "openai_compatible", ""),
+}
+
+
+def _secret_text() -> str:
+    key = os.environ.get("NODE_SECRET_KEY", "").strip()
+    if not key:
+        if not SECRET_KEY_FILE.exists():
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            SECRET_KEY_FILE.write_bytes(Fernet.generate_key())
+            try:
+                os.chmod(SECRET_KEY_FILE, 0o600)
+            except OSError:
+                pass
+        key = SECRET_KEY_FILE.read_text().strip()
+    return key
+
+
+def _fernet() -> Fernet:
+    return Fernet(_secret_text().encode())
+
+
+def install_id() -> str:
+    if not INSTALL_ID_FILE.exists():
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        INSTALL_ID_FILE.write_text(uuid.uuid4().hex)
+    return INSTALL_ID_FILE.read_text().strip()
+
+
+def _enc(value: str) -> str:
+    return "enc:" + _fernet().encrypt(value.encode()).decode() if value else ""
+
+
+def _dec(value: str) -> str:
+    if not value or not value.startswith("enc:"):
+        return value or ""
+    try:
+        return _fernet().decrypt(value[4:].encode()).decode()
+    except InvalidToken:
+        return ""
+
+
+def _env(name: str, default: str = "") -> str:
+    return (os.environ.get(name) or default).strip()
+
+
+def _new_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+# ── แปลงการตั้งค่ารุ่นก่อน ────────────────────────────
+
+def _provider_id_for(cfg: dict) -> str:
+    provider = (cfg.get("provider") or "").lower()
+    base = (cfg.get("base_url") or "").lower()
+    if provider in ("google", "ollama"):
+        return provider
+    if "siliconflow" in base:
+        return "siliconflow"
+    if "api.openai.com" in base:
+        return "openai"
+    return "custom"
+
+
+def _from_role_schema(old: dict) -> dict:
+    """รุ่นแรก (llm/embedding/rerank แยกกันพร้อม key ในตัว) → providers + models (รุ่นที่สอง)"""
+    providers = {pid: {"api_key": "", "base_url": ""} for pid in _LEGACY_PROVIDERS}
+    models: dict = {}
+    for role in LEGACY_KINDS:
+        cfg = old.get(role) or {}
+        pid = _provider_id_for(cfg) if (cfg.get("base_url") or role != "rerank") else "siliconflow"
+        if role == "rerank" and pid not in ("siliconflow", "custom"):
+            pid = "custom"
+        if cfg.get("api_key"):
+            providers[pid]["api_key"] = cfg["api_key"]
+        if pid in ("ollama", "custom") and cfg.get("base_url"):
+            providers[pid]["base_url"] = cfg["base_url"]
+        models[role] = {"provider": pid, "model": cfg.get("model", "")}
+    models["embedding"]["dim"] = int((old.get("embedding") or {}).get("dim") or 0)
+    return {"providers": providers, "models": models,
+            "vector": old.get("vector") or {"url": "", "api_key": ""},
+            "central": old.get("central") or {"url": "", "license_key": ""}}
+
+
+def _upgrade_providers(providers: dict, used: set) -> dict:
+    """providers รุ่นที่ผูก id ตายตัว (ไม่มี type) → การเชื่อมต่อแบบ dynamic — คง id เดิมไว้"""
+    out = {}
+    for pid, prov in providers.items():
+        if "type" in prov:
+            out[pid] = prov
+            continue
+        name, typ, base = _LEGACY_PROVIDERS.get(pid, (pid, "openai_compatible", ""))
+        if not (prov.get("api_key") or prov.get("base_url")) and pid not in used:
+            continue
+        out[pid] = {"name": name, "type": typ, "base_url": prov.get("base_url") or base, "api_key": prov.get("api_key", "")}
+    return out
+
+
+def _models_to_registry(models: dict) -> tuple[dict, dict]:
+    """models รุ่นที่สอง (1 ตัวต่อหน้าที่) → คลังโมเดล + ค่าเริ่มต้น"""
+    registry: dict = {}
+    defaults: dict = {k: None for k in KINDS}
+    for kind in KINDS:
+        m = models.get(kind) or {}
+        if not m.get("model"):
+            continue
+        mid = f"m_{_new_id()[:8]}"
+        entry = {"name": m["model"], "kind": kind, "provider": m.get("provider", ""), "model": m["model"]}
+        if kind == "embedding":
+            entry["dim"] = int(m.get("dim") or 0)
+        registry[mid] = entry
+        defaults[kind] = mid
+    return registry, defaults
+
+
+def _to_current(old_rows: dict) -> dict:
+    """รับการตั้งค่ารุ่นใดก็ได้ (ถอดรหัสแล้ว) → รูปแบบปัจจุบัน"""
+    if "llm" in old_rows:
+        old_rows = _from_role_schema(old_rows)
+    if "models" in old_rows and "registry" not in old_rows:
+        registry, defaults = _models_to_registry(old_rows["models"])
+    else:
+        registry, defaults = old_rows.get("registry", {}), old_rows.get("defaults", {})
+    used = {e.get("provider") for e in registry.values()}
+    return {
+        "providers": _upgrade_providers(old_rows.get("providers", {}), used),
+        "registry": registry,
+        "defaults": {k: defaults.get(k) for k in KINDS},
+        "vector": old_rows.get("vector") or {"url": "", "api_key": ""},
+        "central": old_rows.get("central") or {"url": "", "license_key": ""},
+    }
+
+
+def _guess_vector_type(url: str) -> str:
+    """ไม่ได้ระบุ VECTOR_TYPE: Qdrant ที่อยู่เครื่องเดียวกัน/ใน docker/วง LAN → local (ผ่านท่อ เพราะ central เข้าไม่ถึง)
+    นอกนั้น (เช่น Qdrant Cloud) → qdrant ต่อตรง — กัน .env รุ่นเก่าที่มี QDRANT_URL เป็นคลาวด์ถูกตั้งผิดชนิด"""
+    host = (urlparse(url).hostname or "").lower() if url else ""
+    if not host:
+        return "qdrant"
+    if host == "localhost" or "." not in host:
+        return "local"
+    try:
+        return "local" if not ipaddress.ip_address(host).is_global else "qdrant"
+    except ValueError:
+        return "qdrant"
+
+
+def _defaults_from_env() -> dict:
+    """ค่าเริ่มต้นครั้งแรกจาก .env — node ที่ติดตั้งไว้แล้วจึงย้ายมาใช้หน้าตั้งค่าได้โดยไม่ต้องกรอกใหม่"""
+    return _to_current({
+        # ไม่มีผู้ให้บริการ/โมเดลตั้งไว้ให้ — ว่าง = ไปตั้งที่หน้าตั้งค่าครั้งแรก (ช่องที่ไม่มีชื่อโมเดลถูกข้าม)
+        "llm": {"provider": _env("LLM_PROVIDER") or detect_type(_env("LLM_BASE_URL")), "model": _env("LLM_MODEL"),
+                "api_key": _env("LLM_API_KEY"), "base_url": _env("LLM_BASE_URL")},
+        "embedding": {"provider": _env("EMBED_PROVIDER") or detect_type(_env("EMBED_BASE_URL")),
+                      "model": _env("EMBED_MODEL"),
+                      "api_key": _env("EMBED_API_KEY"), "base_url": _env("EMBED_BASE_URL"),
+                      "dim": int(_env("EMBED_DIM") or 0)},
+        "rerank": {"api_key": _env("RERANK_API_KEY"),
+                   "model": _env("RERANK_MODEL") if _env("RERANK_API_KEY") else "",
+                   "base_url": _env("RERANK_BASE_URL")},
+        "vector": {"type": _env("VECTOR_TYPE") or _guess_vector_type(_env("QDRANT_URL")), "url": _env("QDRANT_URL"),
+                   "api_key": _env("QDRANT_API_KEY")},
+        "central": {"url": _env("CENTRAL_URL", "https://central.1n9ai.com"), "license_key": _env("LICENSE_KEY")},
+    })
+
+
+# ── อ่าน/เขียน ───────────────────────────────────────
+
+def _secret_map(section: str, values: dict, fn) -> dict:
+    if section == "providers":
+        return {pid: {k: (fn(v) if k in SECRET_FIELDS else v) for k, v in prov.items()} for pid, prov in values.items()}
+    if section in ("registry", "defaults", "models"):
+        return values
+    return {k: (fn(v) if k in SECRET_FIELDS else v) for k, v in values.items()}
+
+
+def _write_settings(settings: dict) -> None:
+    global _settings_cache
+    with _db_lock, _db() as c:
+        for section in SECTIONS:
+            c.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                      (section, json.dumps(_secret_map(section, settings.get(section) or {}, _enc), ensure_ascii=False)))
+        c.execute(f"DELETE FROM settings WHERE key IN ({','.join('?' * len(LEGACY_SECTIONS))})", LEGACY_SECTIONS)
+    _settings_cache = None
+
+
+def load_settings() -> dict:
+    """การตั้งค่าแบบถอดรหัสแล้ว (ใช้ภายใน node เท่านั้น ห้ามส่ง key ออกไปหน้าเว็บ)"""
+    global _settings_cache
+    if _settings_cache is not None:
+        return _settings_cache
+    with _db() as c:
+        rows = dict(c.execute("SELECT key, value FROM settings").fetchall())
+    if not rows:
+        _write_settings(_defaults_from_env())
+        return load_settings()
+    decoded = {k: _secret_map(k, json.loads(v), _dec) for k, v in rows.items()}
+    if any(k in decoded for k in LEGACY_SECTIONS) or "registry" not in decoded:
+        _write_settings(_to_current(decoded))
+        return load_settings()
+    settings = {s: decoded.get(s, {}) for s in SECTIONS}
+    settings["defaults"] = {k: settings["defaults"].get(k) for k in KINDS}
+    for section, secret in (("vector", "api_key"), ("central", "license_key")):
+        settings[section].setdefault("url", "")
+        settings[section].setdefault(secret, "")
+    settings["vector"].setdefault("type", "qdrant")
+    _settings_cache = settings
+    return settings
+
+
+def ensure_kb_embeddings() -> None:
+    """KB รุ่นก่อนเก็บแค่ชื่อโมเดล embedding — ผูกเข้ากับรายการในคลังโมเดล (สร้างให้ถ้ายังไม่มี)"""
+    s = load_settings()
+    registry = dict(s["registry"])
+    changed = False
+    for kb in db_all("kbs"):
+        emb = kb.get("embedding") or {}
+        if emb.get("model_id") in registry:
+            continue
+        mid = next((i for i, e in registry.items() if e["kind"] == "embedding"
+                    and e["model"] == emb.get("model") and int(e.get("dim") or 0) == int(emb.get("dim") or 0)), None)
+        if not mid:
+            default_emb = registry.get(s["defaults"].get("embedding") or "") or {}
+            provider = emb.get("provider") if emb.get("provider") in s["providers"] else default_emb.get("provider", "")
+            mid = f"m_{_new_id()[:8]}"
+            registry[mid] = {"name": emb.get("model") or mid, "kind": "embedding", "provider": provider,
+                             "model": emb.get("model", ""), "dim": int(emb.get("dim") or 0)}
+            changed = True
+        kb["embedding"] = {"model_id": mid, "model": registry[mid]["model"], "dim": int(registry[mid].get("dim") or 0)}
+        db_put("kbs", kb["id"], kb)
+    if changed:
+        _write_settings({**s, "registry": registry})
+
+
+# ── ส่งออกให้หน้าเว็บ (ไม่มี key) ─────────────────────
+
+def _mask(value: str) -> dict:
+    return {"set": bool(value), "hint": f"••••{value[-4:]}" if len(value) >= 8 else ("••••" if value else "")}
+
+
+def provider_configured(prov: dict) -> bool:
+    return bool(prov.get("api_key")) if prov.get("type") == "google" else bool(prov.get("base_url"))
+
+
+def public_provider(pid: str, prov: dict) -> dict:
+    return {"id": pid, "name": prov.get("name") or pid, "type": prov.get("type"), "base_url": prov.get("base_url", ""),
+            "api_key": _mask(prov.get("api_key", "")), "configured": provider_configured(prov)}
+
+
+def _model_usage() -> dict[str, dict[str, list[str]]]:
+    usage: dict[str, dict[str, list[str]]] = {}
+    for kb in db_all("kbs"):
+        mid = (kb.get("embedding") or {}).get("model_id")
+        if mid:
+            usage.setdefault(mid, {"kbs": [], "bots": []})["kbs"].append(kb["name"])
+    for bot in db_all("bots"):
+        for field in ("llm_model_id", "rerank_model_id"):
+            if bot.get(field):
+                usage.setdefault(bot[field], {"kbs": [], "bots": []})["bots"].append(bot["name"])
+    return usage
+
+
+def public_settings(settings: dict) -> dict:
+    usage = _model_usage()
+    providers = settings["providers"]
+    return {
+        "providers": [public_provider(pid, prov) for pid, prov in providers.items()],
+        "models": [{"id": mid, **e, "provider_name": (providers.get(e.get("provider")) or {}).get("name", "—"),
+                    "is_default": settings["defaults"].get(e["kind"]) == mid,
+                    "used_by": usage.get(mid, {"kbs": [], "bots": []})}
+                   for mid, e in settings["registry"].items()],
+        "defaults": settings["defaults"],
+        "vector": {"type": settings["vector"].get("type") or "qdrant", "url": settings["vector"].get("url", ""),
+                   "api_key": _mask(settings["vector"].get("api_key", "")),
+                   "tunnel": TUNNEL.state if settings["vector"].get("type") == "local" else None},
+        "central": {"url": settings["central"].get("url", ""), "license_key": _mask(settings["central"].get("license_key", ""))},
+    }
+
+
+def _apply_secret(target: dict, key: str, value) -> None:
+    """ช่อง key: ไม่ส่ง/ส่งว่าง = ใช้ค่าเดิม, ส่ง null = ลบ"""
+    if value is None:
+        target[key] = ""
+    elif isinstance(value, str) and value.strip():
+        target[key] = value.strip()
+
+
+# ── แปลงเป็น credentials ที่ central รับ ──────────────
+
+def _endpoint(prov: dict) -> tuple[str, str | None, str]:
+    """(provider ที่ central รู้จัก, base_url, api_key) — ollama ใช้ endpoint แบบ OpenAI ที่ /v1
+    (แปลงที่ node เพื่อให้ใช้ได้แม้ central ยังเป็นรุ่นที่ไม่รู้จัก ollama)"""
+    key = prov.get("api_key", "")
+    typ = prov.get("type")
+    if typ == "google":
+        return "google", None, key
+    base = (prov.get("base_url") or "").strip().rstrip("/")
+    if typ == "ollama":
+        base = base or "http://localhost:11434"
+        return "openai_compatible", base if base.endswith("/v1") else f"{base}/v1", key or "ollama"
+    return "openai_compatible", base or None, key or "not-needed"
+
+
+def resolve_model(s: dict, kind: str, model_id: str | None = None) -> tuple[str | None, dict | None]:
+    """โมเดลที่เลือกไว้ (ถ้ายังมีอยู่และเป็นประเภทถูก) ไม่งั้นค่าเริ่มต้นของประเภทนั้น"""
+    for mid in (model_id, s["defaults"].get(kind)):
+        e = s["registry"].get(mid or "")
+        if e and e["kind"] == kind:
+            return mid, e
+    return None, None
+
+
+# ── ผู้ให้บริการ/ฐานข้อมูลในวง LAN/VPN ของลูกค้า: ส่งผ่านท่อแทนให้ central ยิงตรง ──
+# central บนอินเทอร์เน็ตมองไม่เห็นที่อยู่ภายใน (และปฏิเสธด้วย url_not_allowed) node ที่อยู่ในวงเดียวกันจึงเป็นคนเรียก
+# ให้ผ่านท่อที่เปิดไว้กับ central — ลูกค้าตั้งค่าเหมือนเดิม node ตัดสินจาก URL เอง URL/key จริงไม่ถูกส่งไป central
+TUNNEL_PROVIDER_BASE = "http://node-tunnel/p/"
+_private_cache: dict[str, tuple[float, bool]] = {}
+_features_cache: dict[str, tuple[float, set]] = {}
+
+
+def _is_private_url(url: str | None) -> bool:
+    """URL ชี้ที่อยู่ภายใน (localhost, LAN, VPN/CGNAT, ชื่อใน docker network) — หาที่อยู่ไม่เจอถือว่าไม่ใช่"""
+    host = (urlparse(url).hostname or "").lower() if url else ""
+    if not host:
+        return False
+    hit = _private_cache.get(host)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    try:
+        addrs = [socket.inet_ntoa(socket.inet_aton(host))]
+    except OSError:
+        try:
+            addrs = [str(i[4][0]) for i in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)]
+        except (socket.gaierror, UnicodeError):
+            addrs = []
+    private = False
+    for addr in addrs:
+        ip = ipaddress.ip_address(addr.split("%")[0])
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        private = private or not ip.is_global
+    _private_cache[host] = (time.time() + 60, private)
+    return private
+
+
+def central_features(settings: dict | None = None) -> set:
+    """features ที่ central ประกาศใน /v1/meta (จำไว้ 5 นาที) — ติดต่อไม่ได้ = ไม่รู้ (ชุดว่าง ลองใหม่ใน 30 วิ)"""
+    url, _ = _central(settings, check=False)
+    hit = _features_cache.get(url)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    try:
+        feats = set(httpx.get(f"{url}/v1/meta", timeout=8, verify=CENTRAL_VERIFY).json().get("features") or [])
+        _features_cache[url] = (time.time() + 300, feats)
+    except Exception:
+        feats = set()
+        _features_cache[url] = (time.time() + 30, feats)
+    return feats
+
+
+def _via_tunnel(s: dict, url: str | None) -> bool:
+    """ที่อยู่นี้ต้องให้ node เป็นคนเรียกผ่านท่อไหม — ใช้เมื่อ central รุ่นนั้นรองรับเท่านั้น (รุ่นเก่ายิงตรงเหมือนเดิม)"""
+    return _is_private_url(url) and "provider_tunnel" in central_features(s)
+
+
+def _provider_target(pid: str) -> tuple[str, str] | None:
+    """(base_url จริง, api_key) ของการเชื่อมต่อที่ central ขอผ่านท่อ — ส่งต่อได้เฉพาะการเชื่อมต่อในวงของเครื่องนี้"""
+    prov = load_settings()["providers"].get(pid)
+    if not prov or prov.get("type") == "google":
+        return None
+    _, base, key = _endpoint(prov)
+    if not base or not _is_private_url(base):
+        return None
+    return base, key
+
+
+def model_creds(s: dict, entry: dict | None) -> dict:
+    if not entry:
+        return {}
+    pid = entry.get("provider") or ""
+    kind, base, key = _endpoint(s["providers"].get(pid, {}))
+    out = {"provider": kind, "model": entry.get("model", ""), "api_key": key}
+    if base and _via_tunnel(s, base):
+        out.update(api_key="tunnel", base_url=TUNNEL_PROVIDER_BASE + pid, tunnel=True)
+        TUNNEL.start()
+    elif base:
+        out["base_url"] = base
+    if entry.get("params"):
+        out["params"] = entry["params"]  # พารามิเตอร์เพิ่มเติมของโมเดล — central ส่งต่อให้ผู้ให้บริการตรง ๆ
+    return out
+
+
+def vector_creds(s: dict) -> dict:
+    v = s["vector"]
+    kind = v.get("type") or "qdrant"
+    if kind == "pgvector":
+        return {"type": "pgvector", "url": v.get("api_key") or ""}
+    if kind == "pinecone":
+        return {"type": "pinecone", "api_key": v.get("api_key") or None}
+    if kind == "local":
+        return {"type": "qdrant", "tunnel": True}  # URL/key ของ Qdrant อยู่ที่ node เท่านั้น
+    if _via_tunnel(s, v.get("url")):  # Qdrant ในวง LAN/VPN ของลูกค้า — central เข้าผ่านท่อแบบเดียวกับ local
+        TUNNEL.start()
+        return {"type": "qdrant", "tunnel": True}
+    return {"url": v.get("url", ""), "api_key": v.get("api_key") or None}
+
+
+def rerank_creds(rr: dict) -> dict:
+    out = {"api_key": rr["api_key"], "model": rr["model"], "base_url": rr.get("base_url"), "params": rr.get("params") or {}}
+    if rr.get("tunnel"):
+        out["tunnel"] = True
+    return out
+
+
+def credentials(settings: dict | None = None, *, llm_id: str | None = None, embedding_id: str | None = None,
+                rerank_id: str | None = None, use_rerank: bool = False) -> dict:
+    s = settings or load_settings()
+    creds = {
+        "llm": model_creds(s, resolve_model(s, "llm", llm_id)[1]),
+        "embedding": model_creds(s, resolve_model(s, "embedding", embedding_id)[1]),
+        "vector": vector_creds(s),
+    }
+    if use_rerank:
+        rr = model_creds(s, resolve_model(s, "rerank", rerank_id)[1])
+        if rr:
+            creds["rerank"] = rerank_creds(rr)
+    # ของในวงลูกค้าวิ่งผ่านท่อ — เพิ่งเปิดเครื่อง/เพิ่งเปลี่ยน central ท่ออาจยังต่อไม่ทัน รอสักครู่ก่อนส่งไป central
+    _await_tunnel(creds)
+    return creds
+
+
+# ── รายชื่อโมเดลจากผู้ให้บริการ ─────────────────────────
+
+# โมเดลที่ไม่ได้รับ-ส่งข้อความ (สร้างเสียง/ภาพ/วิดีโอ) — ไม่แสดงในรายการให้เลือก
+_NON_TEXT_MODEL = re.compile(r"tts|text-to-speech|cosyvoice|voice|audio-gen|image|imagen|flux|stable-diffusion|sdxl|kolors|"
+                             r"dall-e|video|veo|wan2|-vl-?gen|moderation", re.I)
+
+
+def _guess_kinds(model_id: str) -> list[str]:
+    mid = model_id.lower()
+    if _NON_TEXT_MODEL.search(mid):
+        return []
+    if "rerank" in mid:
+        return ["rerank"]
+    if any(w in mid for w in ("whisper", "sensevoice", "transcribe", "asr", "speech-to-text", "stt")):
+        return ["stt"]
+    if any(w in mid for w in ("embed", "bge-", "/bge", "e5-", "gte-", "minilm")):
+        return ["embedding"]
+    return ["llm"]
+
+
+def list_provider_models(prov: dict) -> list[dict]:
+    """ดึงรายชื่อโมเดลจากผู้ให้บริการโดยตรง (ใช้แสดงตัวเลือกในหน้าตั้งค่าเท่านั้น)"""
+    try:
+        if prov.get("type") == "google":
+            if not prov.get("api_key"):
+                raise HTTPException(400, "ใส่ API key ก่อน")
+            r = httpx.get("https://generativelanguage.googleapis.com/v1beta/models",
+                          params={"key": prov["api_key"], "pageSize": 1000}, timeout=15)
+            r.raise_for_status()
+            out = []
+            for m in r.json().get("models", []):
+                methods = m.get("supportedGenerationMethods", [])
+                kinds = (["llm"] if "generateContent" in methods else []) + (["embedding"] if "embedContent" in methods else [])
+                if "generateContent" in methods and m["name"].startswith("models/gemini"):
+                    kinds.append("stt")  # Gemini ถอดเสียงได้ในตัว (multimodal)
+                mid = m["name"].removeprefix("models/")
+                if kinds and not _NON_TEXT_MODEL.search(mid):
+                    out.append({"id": mid, "kinds": kinds})
+            return sorted(out, key=lambda x: x["id"])
+        _, base, key = _endpoint(prov)
+        if not base:
+            raise HTTPException(400, "ใส่ URL ของเซิร์ฟเวอร์ก่อน")
+        headers = {"Authorization": f"Bearer {key}"} if key and key not in ("ollama", "not-needed") else {}
+        r = httpx.get(f"{base}/models", headers=headers, timeout=15)
+        r.raise_for_status()
+        models = ({"id": m["id"], "kinds": _guess_kinds(m["id"])} for m in r.json().get("data", []))
+        return sorted((m for m in models if m["kinds"]), key=lambda x: x["id"])
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        # รหัส error ให้หน้าเว็บแปลเป็นภาษาของผู้ใช้ (locales errors.*) — ข้อความหลัง [code] เป็นสำรอง
+        if code in (400, 401, 403):  # Gemini API ตอบ 400 เมื่อ key ผิด
+            raise HTTPException(400, "[provider_auth_failed] API key ไม่ถูกต้อง ไม่มีสิทธิ์ หรือไม่ตรงกับ URL นี้")
+        if code == 404:
+            raise HTTPException(400, "[provider_endpoint_not_found] ไม่พบ endpoint — ตรวจ URL ของ API")
+        raise HTTPException(400, f"[provider_http_error] ผู้ให้บริการตอบ {code}")
+    except httpx.HTTPError as e:
+        raise HTTPException(400, f"[provider_unreachable] ติดต่อผู้ให้บริการไม่ได้ ({type(e).__name__}) — ตรวจ URL และเครือข่าย")
+
+
+# ══════════════════════════════════════════════
+# Central client
+# ══════════════════════════════════════════════
+
+_tokens: dict[tuple, dict] = {}
+_token_lock = threading.Lock()
+
+
+class CentralError(Exception):
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status, self.code, self.message = status, code, message
+
+
+@app.exception_handler(CentralError)
+async def _central_error_handler(_req: Request, e: CentralError):
+    return JSONResponse({"detail": f"[{e.code}] {e.message}"}, status_code=e.status if e.status < 500 else 502)
+
+
+_LICENSE_STATE_KEY = "license_state"
+DISPLACED_MESSAGE = ("license นี้ถูกเปิดใช้บนเครื่องอื่นล่าสุด — เครื่องนี้หยุดเชื่อมต่อแล้ว ถ้าต้องการใช้ที่เครื่องนี้ "
+                     "ไปที่หลังบ้าน → ภาพรวม แล้วกด ‘ใช้ license บนเครื่องนี้’")
+
+
+def license_displaced() -> bool:
+    with _db() as c:
+        row = c.execute("SELECT value FROM settings WHERE key=?", (_LICENSE_STATE_KEY,)).fetchone()
+    return bool(row and json.loads(row[0]).get("displaced"))
+
+
+def _set_license_displaced(value: bool) -> None:
+    with _db_lock, _db() as c:
+        c.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                  (_LICENSE_STATE_KEY, json.dumps({"displaced": value, "at": _now()})))
+
+
+def _should_reauth(resp: httpx.Response) -> bool:
+    """401 จาก central: ขอ token ใหม่แล้วลองอีกครั้งได้เฉพาะ token หมดอายุ/เสีย — ถ้าถูกเครื่องอื่นแทนที่
+    ห้ามขอใหม่เอง (การขอ token คือการผูก license กลับมาที่เครื่องนี้ = แย่งกันไปมา) ต้องให้ admin กดยืนยัน
+    (ต้องอ่าน body ของ response แล้วก่อนเรียก)"""
+    if resp.status_code != 401:
+        return False
+    try:
+        code = (resp.json().get("error") or {}).get("code")
+    except Exception:
+        code = None
+    if code == "device_replaced":
+        _set_license_displaced(True)
+        with _token_lock:
+            _tokens.clear()
+        return False
+    return code in (None, "token_expired", "auth_invalid")
+
+
+def _raise_for(resp: httpx.Response):
+    if resp.status_code < 400:
+        return
+    try:
+        err = resp.json().get("error") or {}
+    except Exception:
+        err = {}
+    raise CentralError(resp.status_code, err.get("code") or "central_error", err.get("message") or f"central ตอบ {resp.status_code}")
+
+
+# ── ช่องทางไป central ต้องปลอดภัย ─────────────────────
+# ทุก request แนบ key ของ AI + เอกสาร/ข้อมูลลูกค้าไปด้วย จึงห้ามวิ่งผ่าน http บนอินเทอร์เน็ตเด็ดขาด
+# http ยอมเฉพาะปลายทางที่ไม่ออกอินเทอร์เน็ต: เครื่องเดียวกัน, ชื่อ service ใน docker, IP วง LAN (ไว้ dev/ทดสอบ)
+# CENTRAL_CA_FILE (ไม่บังคับ) = ไฟล์ใบรับรอง/CA ที่ยอมรับได้ "อย่างเดียว" สำหรับ central (pin) แทนการเชื่อ CA ทั้งโลก
+_ca_file = os.environ.get("CENTRAL_CA_FILE", "").strip()
+CENTRAL_VERIFY: ssl.SSLContext | bool = ssl.create_default_context(cafile=_ca_file) if _ca_file else True
+
+
+def _insecure_central_reason(url: str) -> str | None:
+    if not url:
+        return None
+    u = urlparse(url)
+    if u.scheme == "https":
+        return None
+    if u.scheme != "http":
+        return "ที่อยู่ central ต้องขึ้นต้นด้วย https://"
+    host = (u.hostname or "").lower()
+    if host == "localhost" or (host and "." not in host):  # localhost หรือชื่อ service ใน docker network
+        return None
+    try:
+        ip = ipaddress.ip_address(host)
+        if not ip.is_global:  # loopback, LAN, CGNAT (เช่น Tailscale)
+            return None
+    except ValueError:
+        pass
+    return ("central ต้องเชื่อมต่อผ่าน https:// — ทุกคำขอมี API key และข้อมูลของคุณ ส่งผ่าน http บนอินเทอร์เน็ตจะถูกดักอ่านได้ "
+            "(http ใช้ได้เฉพาะเครื่องเดียวกันหรือวง LAN)")
+
+
+def _central(settings: dict | None = None, check: bool = True) -> tuple[str, str]:
+    c = (settings or load_settings())["central"]
+    url = (c.get("url") or "").rstrip("/")
+    if check and (reason := _insecure_central_reason(url)):
+        raise CentralError(400, "central_insecure", reason)
+    return url, c.get("license_key") or ""
+
+
+def get_token(force: bool = False, settings: dict | None = None) -> str:
+    url, lic = _central(settings)
+    cache_key = (url, lic)
+    with _token_lock:
+        cached = _tokens.get(cache_key)
+        if not force and cached and cached["exp"] - 60 > time.time():
+            return cached["value"]
+        _tokens.pop(cache_key, None)
+        if not url:
+            raise CentralError(500, "no_central", "ยังไม่ได้ตั้งที่อยู่ central (หลังบ้าน → การเชื่อมต่อ)")
+        if not lic:
+            raise CentralError(500, "no_license", "ยังไม่ได้ใส่ license key (หลังบ้าน → การเชื่อมต่อ)")
+        if license_displaced():
+            raise CentralError(401, "device_replaced", DISPLACED_MESSAGE)
+        try:
+            resp = httpx.post(f"{url}/v1/auth/token", json={"license_key": lic, "install_id": install_id()}, timeout=20, verify=CENTRAL_VERIFY)
+        except httpx.HTTPError as e:
+            raise CentralError(502, "central_unreachable", f"ติดต่อ central ที่ {url} ไม่ได้ ({type(e).__name__})")
+        _raise_for(resp)
+        body = resp.json()
+        _tokens[cache_key] = {"value": body["access_token"], "tenant_id": body.get("tenant_id"),
+                              "exp": time.time() + int(body.get("expires_in", 900)),
+                              "license": body.get("license"), "warnings": body.get("warnings") or []}
+        return body["access_token"]
+
+
+def token_info(settings: dict | None = None) -> dict:
+    return _tokens.get(_central(settings)) or {}
+
+
+def live_license(settings: dict | None = None) -> dict:
+    """สถานะ license ตอนนี้จาก central — ค่าใน token_info คือค่าตอนขอ token (จำไว้ได้ถึง 15 นาที) จึงไม่ทันการ
+    ระงับ/ต่ออายุ ถ้าถูกระงับ central ตอบรหัสนั้นกลับมาเป็น CentralError
+    central รุ่นเก่าที่ยังไม่มี /v1/license → ใช้ค่าที่จำไว้แทน"""
+    url, _ = _central(settings)
+    resp = None
+    for attempt in range(2):
+        token = get_token(force=attempt > 0, settings=settings)
+        try:
+            resp = httpx.get(f"{url}/v1/license", headers={"Authorization": f"Bearer {token}"}, timeout=10, verify=CENTRAL_VERIFY)
+        except httpx.HTTPError as e:
+            raise CentralError(502, "central_unreachable", f"ติดต่อ central ไม่ได้ ({type(e).__name__})")
+        if resp.status_code == 404:
+            info = token_info(settings)
+            return {"license": info.get("license"), "warnings": info.get("warnings")}
+        if attempt == 0 and _should_reauth(resp):
+            continue
+        break
+    _raise_for(resp)
+    return resp.json()
+
+
+def central_json(path: str, body: dict, settings: dict | None = None) -> dict:
+    url, _ = _central(settings)
+    resp = None
+    for attempt in range(2):
+        token = get_token(force=attempt > 0, settings=settings)
+        try:
+            resp = httpx.post(f"{url}{path}", json=body, headers={"Authorization": f"Bearer {token}"}, timeout=TIMEOUT,
+                              verify=CENTRAL_VERIFY)
+        except httpx.HTTPError as e:
+            raise CentralError(502, "central_unreachable", f"ติดต่อ central ไม่ได้ ({type(e).__name__})")
+        if attempt == 0 and _should_reauth(resp):
+            continue
+        break
+    _raise_for(resp)
+    return resp.json()
+
+
+def kb_payload(kb: dict, s: dict | None = None) -> dict:
+    """KB ที่ส่งให้ central — แนบ credentials ของ embedding ที่ KB นี้ผูกไว้ (central รุ่นใหม่ใช้สร้าง embedding ต่อ KB)"""
+    s = s or load_settings()
+    emb = kb.get("embedding") or {}
+    _, entry = resolve_model(s, "embedding", emb.get("model_id"))
+    return {"kb_id": kb["id"], "name": kb["name"], "collection_name": kb["collection_name"],
+            "embedding": {"model": emb.get("model"), "dim": emb.get("dim")},
+            "credentials": model_creds(s, entry) if entry and emb.get("model_id") in s["registry"] else {}}
+
+
+def _kb_ctx(kb: dict) -> dict:
+    return {"credentials": credentials(embedding_id=(kb.get("embedding") or {}).get("model_id"))}
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_filename(name: str) -> str:
+    name = Path(name or "").name
+    if not name or name in {".", ".."}:
+        raise HTTPException(400, "ชื่อไฟล์ไม่ถูกต้อง")
+    return name
+
+
+def chat_once(bot_id: str, message: str, history: list | None = None) -> str:
+    """ถามบอทแบบไม่ stream (ใช้กับ LINE) — เส้นทางเดียวกับหน้าแชท: central /v1/chat"""
+    bot = _get_bot(bot_id)
+    stamp = _cache_stamp(bot)
+    payload = _chat_payload(bot, message, stamp, clean_history(history))
+    url, _ = _central()
+    resp = None
+    for attempt in range(2):
+        token = get_token(force=attempt > 0)
+        resp = httpx.post(f"{url}/v1/chat", headers={"Authorization": f"Bearer {token}"}, timeout=TIMEOUT, verify=CENTRAL_VERIFY,
+                          data={"payload": json.dumps(payload, ensure_ascii=False)})
+        if attempt == 0 and _should_reauth(resp):
+            continue
+        break
+    _raise_for(resp)
+    return str(_after_done(bot_id, stamp, resp.json()).get("reply") or "")
+
+
+def _channel_secrets(row: dict | None) -> dict | None:
+    if not row:
+        return None
+    return {**row, "channel_secret": _dec(row.get("channel_secret", "")), "access_token": _dec(row.get("access_token", ""))}
+
+
+def _thai_day() -> str:
+    return datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d")
+
+
+def _channel_record(channel_id: str, error: str | None) -> None:
+    with _db_lock:
+        row = db_get("channels", channel_id)
+        if row:
+            row["last_event_at"] = _now()
+            row["last_error"] = error
+            row["messages_total"] = int(row.get("messages_total") or 0) + (0 if error else 1)
+            if error and error.startswith("[task_limit]"):
+                # questions customers asked after today's free tasks ran out — the owner sees this count on the admin banner
+                today = _thai_day()
+                missed = row.get("missed") or {}
+                row["missed"] = {"day": today, "n": (int(missed.get("n") or 0) if missed.get("day") == today else 0) + 1}
+            db_put("channels", channel_id, row)
+
+
+LINE = line_channel.LineService(
+    get_channel=lambda cid: _channel_secrets(db_get("channels", cid)),
+    ask=chat_once,
+    welcome_text=lambda bot_id: ((db_get("bots", bot_id) or {}).get("welcome_message") or ""),
+    record=_channel_record,
+)
+
+
+def _on_line_frame(msg: dict) -> dict:
+    try:
+        body = base64.b64decode(msg.get("body") or "")
+    except ValueError:
+        return {"status": 400}
+    return {"status": LINE.handle_webhook(str(msg.get("channel_id") or ""), str(msg.get("signature") or ""), body)}
+
+
+TUNNEL = TunnelClient(
+    central_url=lambda: _central(check=False)[0],
+    token=lambda force: get_token(force=force),
+    target=lambda: (load_settings()["vector"].get("url", ""), load_settings()["vector"].get("api_key") or None),
+    verify=CENTRAL_VERIFY,
+    on_line=_on_line_frame,
+    provider=_provider_target,
+)
+
+
+def _needs_tunnel(s: dict) -> bool:
+    if s["vector"].get("type") == "local" or db_all("channels"):
+        return True
+    # การเชื่อมต่อ AI หรือ Qdrant ที่อยู่ในวงของลูกค้า (central เข้าผ่านท่อ)
+    urls = [_endpoint(p)[1] for p in s["providers"].values() if p.get("type") != "google"]
+    if (s["vector"].get("type") or "qdrant") == "qdrant":
+        urls.append(s["vector"].get("url"))
+    return any(_is_private_url(u) for u in urls) and "provider_tunnel" in central_features(s)
+
+
+def sync_tunnel() -> None:
+    """เปิดท่อเมื่อมีอะไรที่ central ต้องเข้าผ่าน node (Qdrant/AI ในวงของลูกค้า, LINE, API) ปิดเมื่อไม่มีแล้ว"""
+    if _needs_tunnel(load_settings()):
+        TUNNEL.start()
+    else:
+        TUNNEL.stop()
+
+
+def _await_tunnel(creds: dict, seconds: float = 10) -> None:
+    """credentials ที่ต้องผ่านท่อแต่ท่อเพิ่งเปิด (เช่นเพิ่งเพิ่มการเชื่อมต่อ) — รอให้ต่อติดสักครู่ก่อนส่งไป central"""
+    if not any(isinstance(v, dict) and v.get("tunnel") for v in creds.values()):
+        return
+    end = time.time() + seconds
+    while TUNNEL.state["status"] != "connected" and time.time() < end:
+        time.sleep(0.3)
+
+
+@app.on_event("startup")
+def _startup():
+    init_db()
+    migrate_legacy_state()
+    load_settings()
+    ensure_kb_embeddings()
+    start_realtime_scheduler()
+    sync_tunnel()
+    threading.Thread(target=_backfill_line_ids, name="line-id-backfill", daemon=True).start()
+
+
+# ══════════════════════════════════════════════
+# หลังบ้าน: การเชื่อมต่อ (Settings) + สถานะ
+# ══════════════════════════════════════════════
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.get("/api/admin/settings")
+def get_settings():
+    return {"settings": public_settings(load_settings()), "protocols": PROTOCOLS}
+
+
+@app.put("/api/admin/settings")
+def save_settings(body: dict = Body(...)):
+    """บันทึกโครงสร้างพื้นฐาน (vector database, central/license) — การเชื่อมต่อและคลังโมเดลมี endpoint ของตัวเอง"""
+    s = load_settings()
+    incoming = body.get("settings") or {}
+    new = json.loads(json.dumps(s))
+    for section, secret in (("vector", "api_key"), ("central", "license_key")):
+        for k, v in (incoming.get(section) or {}).items():
+            if k == secret:
+                _apply_secret(new[section], k, v)
+            elif k == "url":
+                new[section]["url"] = (v or "").strip()
+            elif k == "type" and section == "vector":
+                if v not in VECTOR_TYPES:
+                    raise HTTPException(400, f"ชนิดฐานข้อมูลต้องเป็น {', '.join(VECTOR_TYPES)}")
+                new["vector"]["type"] = v
+                if v not in ("qdrant", "local"):
+                    new["vector"]["url"] = ""  # URL ใช้กับ Qdrant เท่านั้น — ไม่ให้ค่าเก่าค้างไปปนกับชนิดอื่น
+    if (reason := _insecure_central_reason(new["central"].get("url", "").rstrip("/"))):
+        raise HTTPException(400, reason)
+    _write_settings(new)
+    with _token_lock:
+        _tokens.clear()
+    if "license_key" in (incoming.get("central") or {}):
+        _set_license_displaced(False)
+    if new["central"] != s["central"]:
+        TUNNEL.reconnect()  # ท่อเส้นเดิมยังต่อกับ central/license ตัวเก่า — ต่อใหม่ด้วยค่าใหม่
+    sync_tunnel()
+    return {"settings": public_settings(load_settings())}
+
+
+# ── การเชื่อมต่อ ─────────────────────────────────────
+
+class ProviderIn(BaseModel):
+    name: str
+    base_url: str = ""
+    api_key: str | None = ""  # "" = ใช้ค่าเดิม (ตอนแก้ไข), null = ลบ
+
+
+def detect_type(base_url: str, existing_type: str | None = None) -> str:
+    """เดารูปแบบ API จาก URL ให้ผู้ใช้กรอกแค่ URL/key เหมือนใส่ใน .env"""
+    url = (base_url or "").strip().lower()
+    if not url:
+        return existing_type or "google"
+    if "generativelanguage.googleapis.com" in url and "/openai" not in url:
+        return "google"
+    if ":11434" in url or "ollama" in url:
+        return "ollama"
+    return "openai_compatible"
+
+
+def _provider_from_input(req: ProviderIn, existing: dict | None = None) -> dict:
+    if not req.name.strip():
+        raise HTTPException(400, "กรุณาตั้งชื่อการเชื่อมต่อ")
+    prov = {"name": req.name.strip(), "type": detect_type(req.base_url, (existing or {}).get("type")),
+            "base_url": req.base_url.strip(), "api_key": (existing or {}).get("api_key", "")}
+    _apply_secret(prov, "api_key", req.api_key)
+    if prov["type"] == "google" and not prov["api_key"]:
+        raise HTTPException(400, "Google Gemini ต้องใช้ API key")
+    return prov
+
+
+def _update_settings(**sections) -> None:
+    _write_settings({**load_settings(), **sections})
+
+
+@app.post("/api/admin/providers")
+def create_provider(req: ProviderIn):
+    s = load_settings()
+    pid = "p_" + _new_id()[:8]
+    _update_settings(providers={**s["providers"], pid: _provider_from_input(req)})
+    sync_tunnel()
+    return public_provider(pid, load_settings()["providers"][pid])
+
+
+@app.put("/api/admin/providers/{pid}")
+def update_provider(pid: str, req: ProviderIn):
+    s = load_settings()
+    if pid not in s["providers"]:
+        raise HTTPException(404, "ไม่พบการเชื่อมต่อนี้")
+    _update_settings(providers={**s["providers"], pid: _provider_from_input(req, s["providers"][pid])})
+    sync_tunnel()
+    return public_provider(pid, load_settings()["providers"][pid])
+
+
+@app.delete("/api/admin/providers/{pid}")
+def delete_provider(pid: str):
+    s = load_settings()
+    if pid not in s["providers"]:
+        raise HTTPException(404, "ไม่พบการเชื่อมต่อนี้")
+    used = [e["name"] for e in s["registry"].values() if e.get("provider") == pid]
+    if used:
+        raise HTTPException(409, f"มีโมเดลในคลังใช้การเชื่อมต่อนี้อยู่ ({', '.join(used)}) — ลบโมเดลเหล่านั้นก่อน")
+    _update_settings(providers={k: v for k, v in s["providers"].items() if k != pid})
+    sync_tunnel()
+    return {"message": "ลบการเชื่อมต่อแล้ว"}
+
+
+@app.post("/api/admin/providers/test")
+def test_provider(body: dict = Body(...)):
+    """ทดสอบการเชื่อมต่อที่ยังไม่บันทึก (หรือที่แก้อยู่) โดยดึงรายชื่อโมเดล — ช่อง key ว่าง = ใช้ key เดิมของ id นั้น"""
+    existing = load_settings()["providers"].get(body.get("id") or "", {})
+    base = (body.get("base_url") or "").strip()
+    prov = {"type": detect_type(base, existing.get("type")), "base_url": base, "api_key": existing.get("api_key", "")}
+    _apply_secret(prov, "api_key", body.get("api_key", ""))
+    if prov["type"] == "google" and not prov["api_key"]:
+        raise HTTPException(400, "ใส่ API key ก่อน")
+    return {"models": list_provider_models(prov), "type": prov["type"]}
+
+
+@app.post("/api/admin/providers/{pid}/models")
+def provider_models(pid: str):
+    prov = load_settings()["providers"].get(pid)
+    if not prov:
+        raise HTTPException(404, "ไม่พบการเชื่อมต่อนี้")
+    return {"models": list_provider_models(prov)}
+
+
+# ── คลังโมเดล ────────────────────────────────────────
+
+class ModelIn(BaseModel):
+    name: str = ""
+    kind: str
+    provider: str
+    model: str
+    dim: int = 0
+    make_default: bool = False
+    params: dict | str | None = None  # JSON object หรือข้อความ JSON — ส่งต่อให้ผู้ให้บริการตรง ๆ
+
+
+PARAMS_MAX_CHARS = 8000
+
+
+def _parse_params(raw) -> dict:
+    """พารามิเตอร์เพิ่มเติมของโมเดล: รับได้ทั้ง object และข้อความ JSON (ช่องกรอกในหน้าเว็บ) — ว่าง = {}"""
+    if raw is None or raw == "" or raw == {}:
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise HTTPException(400, f"พารามิเตอร์เพิ่มเติมต้องเป็น JSON — {e.msg} (บรรทัด {e.lineno})")
+    if not isinstance(raw, dict):
+        raise HTTPException(400, 'พารามิเตอร์เพิ่มเติมต้องเป็น JSON object เช่น {"temperature": 0.2}')
+    if len(json.dumps(raw, ensure_ascii=False)) > PARAMS_MAX_CHARS:
+        raise HTTPException(400, "พารามิเตอร์เพิ่มเติมยาวเกินไป")
+    return raw
+
+
+def _model_from_input(req: ModelIn, s: dict) -> dict:
+    if req.kind not in KINDS:
+        raise HTTPException(400, "ประเภทโมเดลไม่ถูกต้อง")
+    if req.provider not in s["providers"]:
+        raise HTTPException(400, "เลือกการเชื่อมต่อก่อน")
+    if not req.model.strip():
+        raise HTTPException(400, "ใส่ชื่อโมเดล")
+    if req.kind == "rerank" and s["providers"][req.provider].get("type") == "google":
+        raise HTTPException(400, "Rerank ต้องใช้การเชื่อมต่อแบบ OpenAI-compatible ที่มี endpoint /rerank")
+    if req.kind == "stt" and s["providers"][req.provider].get("type") == "ollama":
+        raise HTTPException(400, "Ollama ยังไม่มี API ถอดเสียง — ใช้ Gemini หรือเจ้าที่มี /audio/transcriptions (เช่น Whisper)")
+    entry = {"name": req.name.strip() or req.model.strip(), "kind": req.kind, "provider": req.provider, "model": req.model.strip()}
+    params = _parse_params(req.params)
+    if params:
+        entry["params"] = params
+    if req.kind == "embedding":
+        if req.dim <= 0:
+            raise HTTPException(400, "Embedding ต้องระบุจำนวนมิติ (dim) — กดตรวจเพื่อหาค่าที่ถูกต้อง")
+        entry["dim"] = int(req.dim)
+    return entry
+
+
+@app.post("/api/admin/models")
+def create_model(req: ModelIn):
+    s = load_settings()
+    entry = _model_from_input(req, s)
+    mid = f"m_{_new_id()[:8]}"
+    defaults = dict(s["defaults"])
+    if req.make_default or not defaults.get(req.kind):
+        defaults[req.kind] = mid
+    _update_settings(registry={**s["registry"], mid: entry}, defaults=defaults)
+    return {"id": mid}
+
+
+@app.put("/api/admin/models/{mid}")
+def update_model(mid: str, req: ModelIn):
+    s = load_settings()
+    old = s["registry"].get(mid)
+    if not old:
+        raise HTTPException(404, "ไม่พบโมเดลนี้")
+    entry = _model_from_input(ModelIn(**{**req.model_dump(), "kind": old["kind"]}), s)
+    used_kbs = _model_usage().get(mid, {}).get("kbs", [])
+    if old["kind"] == "embedding" and used_kbs and (entry["model"] != old["model"] or entry["dim"] != old.get("dim")
+                                                    or (entry.get("params") or {}) != (old.get("params") or {})):
+        # params ของ embedding อาจเปลี่ยน vector (เช่น dimensions, task_type) — เทียบกับของเดิมใน KB ไม่ได้
+        raise HTTPException(409, f"embedding นี้ผูกกับ KB อยู่ ({', '.join(used_kbs)}) — เปลี่ยนโมเดล มิติ หรือพารามิเตอร์ไม่ได้ แก้ได้แค่ชื่อและการเชื่อมต่อ")
+    defaults = dict(s["defaults"])
+    if req.make_default:
+        defaults[old["kind"]] = mid
+    _update_settings(registry={**s["registry"], mid: entry}, defaults=defaults)
+    if old["kind"] == "embedding":
+        for kb in db_all("kbs"):
+            if (kb.get("embedding") or {}).get("model_id") == mid:
+                kb["embedding"] = {"model_id": mid, "model": entry["model"], "dim": entry["dim"]}
+                db_put("kbs", kb["id"], kb)
+    return {"id": mid}
+
+
+@app.delete("/api/admin/models/{mid}")
+def delete_model(mid: str):
+    s = load_settings()
+    entry = s["registry"].get(mid)
+    if not entry:
+        raise HTTPException(404, "ไม่พบโมเดลนี้")
+    usage = _model_usage().get(mid, {"kbs": [], "bots": []})
+    if usage["kbs"]:
+        raise HTTPException(409, f"มี KB ใช้ embedding นี้อยู่ ({', '.join(usage['kbs'])}) — ลบ KB เหล่านั้นก่อนจึงจะลบได้")
+    if usage["bots"]:
+        raise HTTPException(409, f"มีบอทเลือกโมเดลนี้อยู่ ({', '.join(usage['bots'])}) — เปลี่ยนโมเดลในหน้า Chatbots ก่อน")
+    registry = {k: v for k, v in s["registry"].items() if k != mid}
+    defaults = dict(s["defaults"])
+    if defaults.get(entry["kind"]) == mid:  # ลบตัวที่เป็นค่าเริ่มต้น → ยกตัวอื่นประเภทเดียวกันขึ้นแทน (ถ้ามี)
+        defaults[entry["kind"]] = next((k for k, v in registry.items() if v["kind"] == entry["kind"]), None)
+    _update_settings(registry=registry, defaults=defaults)
+    return {"message": "ลบโมเดลแล้ว"}
+
+
+@app.post("/api/admin/models/{mid}/default")
+def set_default_model(mid: str):
+    s = load_settings()
+    entry = s["registry"].get(mid)
+    if not entry:
+        raise HTTPException(404, "ไม่พบโมเดลนี้")
+    _update_settings(defaults={**s["defaults"], entry["kind"]: mid})
+    return {"message": "ตั้งเป็นค่าเริ่มต้นแล้ว"}
+
+
+@app.post("/api/admin/models/test")
+def test_model(body: dict = Body(...)):
+    """ทดสอบโมเดลก่อนบันทึก ผ่าน central (เส้นทางเดียวกับใช้งานจริง) — embedding จะได้จำนวนมิติกลับมาด้วย"""
+    s = load_settings()
+    kind = body.get("kind")
+    prov = s["providers"].get(body.get("provider") or "")
+    if kind not in KINDS or not prov:
+        raise HTTPException(400, "เลือกประเภทและการเชื่อมต่อก่อน")
+    cfg = model_creds(s, {"provider": body.get("provider"), "model": (body.get("model") or "").strip(),
+                          "params": _parse_params(body.get("params"))})
+    creds = credentials(s, use_rerank=False)
+    if kind == "rerank":
+        creds["rerank"] = rerank_creds(cfg)
+    else:
+        creds[kind] = cfg
+    _await_tunnel(creds)
+    result = central_json("/v1/credentials/check", {"ctx": {"credentials": creds}})
+    return result.get(kind) or {"ok": False, "message": "ไม่ได้ผลตรวจ"}
+
+
+# ── ตรวจ / สถานะ ─────────────────────────────────────
+
+def _run_check(settings: dict) -> dict:
+    """ตรวจทุกส่วนด้วยค่าเริ่มต้นของแต่ละประเภท"""
+    url, _ = _central(settings, check=False)
+    out: dict = {"central": {"url": url}}
+    try:
+        if (reason := _insecure_central_reason(url)):
+            raise ValueError(reason)
+        meta = httpx.get(f"{url}/v1/meta", timeout=10, verify=CENTRAL_VERIFY).json()
+        out["central"].update({"ok": True, "api_version": meta.get("api_version")})
+    except Exception as e:
+        out["central"].update({"ok": False, "message": str(e) if isinstance(e, ValueError) else f"ติดต่อ central ไม่ได้ ({type(e).__name__})"})
+        return out
+    try:
+        info = live_license(settings)
+        out["license"] = {"ok": True, **(info.get("license") or {}), "warnings": info.get("warnings")}
+    except CentralError as e:
+        out["license"] = {"ok": False, "code": e.code, "message": e.message}
+        return out
+    try:
+        creds = credentials(settings, use_rerank=True)
+        stt_creds = model_creds(settings, resolve_model(settings, "stt")[1])
+        if stt_creds:
+            creds["stt"] = stt_creds
+        _await_tunnel(creds)
+        check = central_json("/v1/credentials/check", {"ctx": {"credentials": creds}}, settings=settings)
+        for k in ("llm", "embedding", "vector", "rerank", "stt"):
+            out[k] = check.get(k)
+        _, emb = resolve_model(settings, "embedding")
+        got = (check.get("embedding") or {}).get("dim")
+        if emb and got and int(emb.get("dim") or 0) != got:
+            out["embedding"]["dim_mismatch"] = {"configured": emb.get("dim"), "actual": got}
+    except CentralError as e:
+        out["llm"] = {"ok": False, "error_code": e.code, "message": e.message}
+    return out
+
+
+@app.post("/api/admin/check")
+def check_saved():
+    return _run_check(load_settings())
+
+
+@app.get("/api/health")
+def health():
+    return _run_check(load_settings())
+
+
+@app.get("/api/admin/status")
+def admin_status():
+    s = load_settings()
+    url, _ = _central(s, check=False)
+    central: dict = {"url": url}
+    try:
+        if (reason := _insecure_central_reason(url)):
+            raise ValueError(reason)
+        meta = httpx.get(f"{url}/v1/meta", timeout=8, verify=CENTRAL_VERIFY).json()
+        central.update({"ok": True, "api_version": meta.get("api_version")})
+    except Exception as e:
+        central.update({"ok": False, "message": str(e) if isinstance(e, ValueError) else f"ติดต่อ central ไม่ได้ ({type(e).__name__})"})
+    license_info: dict = {"displaced": license_displaced()}
+    if central["ok"]:
+        try:
+            info = live_license(s)
+            license_info = {"ok": True, **(info.get("license") or {}), "warnings": info.get("warnings"), "displaced": False}
+        except CentralError as e:
+            license_info = {"ok": False, "code": e.code, "message": e.message, "displaced": e.code == "device_replaced"}
+
+    def default_of(kind: str) -> dict | None:
+        mid, e = resolve_model(s, kind)
+        if not e:
+            return None
+        return {"id": mid, "name": e["name"], "model": e["model"], "dim": e.get("dim"),
+                "provider_name": (s["providers"].get(e.get("provider")) or {}).get("name", "—")}
+
+    kbs = db_all("kbs")
+    return {
+        "central": central,
+        "license": license_info,
+        "defaults": {k: default_of(k) for k in KINDS},
+        "model_counts": {k: sum(1 for e in s["registry"].values() if e["kind"] == k) for k in KINDS},
+        "counts": {"kbs": len(kbs), "files": sum(len(kb.get("files", {})) for kb in kbs),
+                   "chunks": sum(f.get("chunks", 0) for kb in kbs for f in kb.get("files", {}).values()),
+                   "bots": len(db_all("bots")), "skills": len(db_all("skills"))},
+        "usage": get_usage(),
+    }
+
+
+@app.post("/api/admin/license/claim")
+def claim_license():
+    """ย้าย license กลับมาใช้ที่เครื่องนี้ (admin กดเอง) — เครื่องอื่นที่ใช้อยู่จะถูกตัดแทน
+    central จำกัดจำนวนครั้งที่สลับเครื่องต่อชั่วโมง กันสองเครื่องผลัดกันใช้ key เดียว"""
+    _set_license_displaced(False)
+    get_token(force=True)
+    info = token_info()
+    return {"ok": True, "license": info.get("license"), "warnings": info.get("warnings")}
+
+
+# ── แพ็กเกจ / ชำระเงิน (Stripe อยู่ที่ central) ─────────
+# ยืนยันตัวด้วย license key ตรง ๆ ไม่ใช่ token — ตอน demo/license หมดอายุ token ขอไม่ได้ ซึ่งเป็นจังหวะที่ต้องจ่ายพอดี
+
+def _billing_call(method: str, path: str, body: dict | None = None) -> dict:
+    s = load_settings()
+    url, lic = _central(s)
+    try:
+        resp = httpx.request(method, f"{url}{path}", json=body, headers={"X-License-Key": lic}, timeout=30, verify=CENTRAL_VERIFY)
+    except httpx.HTTPError as e:
+        raise CentralError(502, "central_unreachable", f"ติดต่อ central ไม่ได้ ({type(e).__name__})")
+    if resp.status_code == 404:
+        raise CentralError(404, "billing_unavailable", "central นี้ยังไม่เปิดระบบชำระเงิน — ติดต่อผู้ให้บริการเพื่อต่ออายุ")
+    _raise_for(resp)
+    return resp.json()
+
+
+@app.get("/api/admin/billing")
+def billing_status():
+    try:
+        return _billing_call("GET", "/v1/billing/status")
+    except CentralError as e:
+        return {"enabled": False, "message": e.message}
+
+
+@app.post("/api/admin/billing/checkout")
+def billing_checkout(body: dict = Body(default={})):
+    """คืน URL หน้าชำระเงินของ Stripe — จ่ายเสร็จ Stripe พากลับมาที่ return_url (หน้าหลังบ้านของเครื่องนี้)"""
+    interval = body.get("interval") if body.get("interval") in ("month", "year") else "month"
+    return _billing_call("POST", "/v1/billing/checkout", {"interval": interval, "return_url": body.get("return_url") or ""})
+
+
+@app.post("/api/admin/billing/portal")
+def billing_portal(body: dict = Body(default={})):
+    """หน้าจัดการการชำระเงินของ Stripe (เปลี่ยนบัตร / ยกเลิก / ดูใบเสร็จ)"""
+    return _billing_call("POST", "/v1/billing/portal", {"return_url": body.get("return_url") or ""})
+
+
+@app.get("/api/usage")
+def usage():
+    return get_usage()
+
+
+# ══════════════════════════════════════════════
+# Knowledge Bases
+# ══════════════════════════════════════════════
+
+class KbCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+    embedding_model_id: str | None = None  # ว่าง = ค่าเริ่มต้น
+
+
+def _kb_out(kb: dict, with_files: bool = False) -> dict:
+    files = kb.get("files", {})
+    sources = [s for s in db_all("sources") if s.get("kb_id") == kb["id"]]
+    out = {
+        "id": kb["id"], "name": kb["name"], "description": kb.get("description", ""),
+        "collection_name": kb["collection_name"], "created_at": kb["created_at"],
+        "file_count": len(files), "source_count": len(sources),
+        "chunk_count": sum(f.get("chunks", 0) for f in files.values()) + sum(int(s.get("last_chunks") or 0) for s in sources),
+        "embedding": {**kb["embedding"], "name": _embedding_name(kb)},
+        "embedding_available": (kb.get("embedding") or {}).get("model_id") in load_settings()["registry"],
+    }
+    if with_files:
+        out["files"] = [{"name": n, "size": f.get("size", 0), "type": Path(n).suffix.lstrip("."),
+                         "chunks": f.get("chunks", 0), "uploaded_at": f.get("uploaded_at")} for n, f in files.items()]
+    return out
+
+
+def _embedding_name(kb: dict) -> str:
+    e = load_settings()["registry"].get((kb.get("embedding") or {}).get("model_id") or "")
+    return e["name"] if e else (kb.get("embedding") or {}).get("model", "—")
+
+
+def _get_kb(kb_id: str) -> dict:
+    kb = db_get("kbs", kb_id)
+    if not kb:
+        raise HTTPException(404, "ไม่พบ Knowledge Base")
+    return kb
+
+
+@app.get("/api/kb")
+def list_kbs():
+    return {"knowledge_bases": [_kb_out(kb) for kb in db_all("kbs")]}
+
+
+@app.post("/api/kb")
+def create_kb(req: KbCreateRequest):
+    if not req.name.strip():
+        raise HTTPException(400, "กรุณาระบุชื่อ Knowledge Base")
+    mid, entry = resolve_model(load_settings(), "embedding", req.embedding_model_id)
+    if not entry:
+        raise HTTPException(400, "ยังไม่มีโมเดล embedding — เพิ่มที่หลังบ้าน → การเชื่อมต่อ AI ก่อนสร้าง Knowledge Base")
+    if req.embedding_model_id and mid != req.embedding_model_id:
+        raise HTTPException(400, "ไม่พบโมเดล embedding ที่เลือก")
+    kb_id = _new_id()
+    kb = {
+        "id": kb_id, "name": req.name.strip(), "description": req.description.strip(),
+        "collection_name": f"kb_{kb_id}",
+        # ผูก embedding ตอนสร้าง — เปลี่ยนทีหลังไม่ได้ (vector ต่างโมเดลเทียบกันไม่ได้)
+        "embedding": {"model_id": mid, "model": entry["model"], "dim": int(entry.get("dim") or 0)},
+        "files": {}, "revision": 0, "created_at": _now(),
+    }
+    central_json("/v1/kb/ensure", {"ctx": _kb_ctx(kb), "kb": kb_payload(kb)})
+    db_put("kbs", kb_id, kb)
+    return _kb_out(kb)
+
+
+@app.get("/api/kb/{kb_id}")
+def get_kb(kb_id: str):
+    return _kb_out(_get_kb(kb_id), with_files=True)
+
+
+@app.delete("/api/kb/{kb_id}")
+def delete_kb(kb_id: str):
+    kb = _get_kb(kb_id)
+    central_json("/v1/kb/drop", {"ctx": _kb_ctx(kb), "kb": kb_payload(kb)})
+    db_delete("kbs", kb_id)
+    for src in db_all("sources"):
+        if src.get("kb_id") == kb_id:
+            db_delete("sources", src["id"])
+    for bot in db_all("bots"):
+        if kb_id in bot["kb_ids"]:
+            bot["kb_ids"] = [k for k in bot["kb_ids"] if k != kb_id]
+            db_put("bots", bot["id"], bot)
+    folder = ORIGINALS_DIR / kb_id
+    if folder.exists():
+        for f in folder.iterdir():
+            f.unlink(missing_ok=True)
+        folder.rmdir()
+    return {"message": "ลบ Knowledge Base สำเร็จ"}
+
+
+# ความคืบหน้าของไฟล์ที่กำลังนำเข้า (ตัวเลขจาก central) — อยู่ในหน่วยความจำเท่านั้น หายเมื่อเสร็จหรือ restart
+# key = "<kb_id>/<filename>" ใช้กันการอัปโหลดไฟล์เดิมซ้ำระหว่างที่ยังทำอยู่ (เสียค่า AI ซ้ำทั้งก้อน)
+_ingest_progress: dict[str, dict] = {}
+_ingest_progress_lock = threading.Lock()
+_PROGRESS_FIELDS = ("stage", "elapsed_s", "pages", "done", "total", "unit", "percent")
+
+
+def _ingest_via_central(kb: dict, filename: str, data: bytes, replace_existing: bool = True,
+                        extra_metadata: dict | None = None, ctx: dict | None = None,
+                        progress_key: str | None = None) -> dict:
+    url, _ = _central()
+    source = {"filename": filename, "replace_existing": replace_existing}
+    if extra_metadata:
+        source["extra_metadata"] = extra_metadata
+    payload = {"ctx": ctx or _kb_ctx(kb), "kb": kb_payload(kb), "source": source}
+    for attempt in range(2):
+        headers = {"Authorization": f"Bearer {get_token(force=attempt > 0)}"}
+        try:
+            with httpx.stream("POST", f"{url}/v1/ingest/file", headers=headers, timeout=TIMEOUT, verify=CENTRAL_VERIFY,
+                              data={"payload": json.dumps(payload, ensure_ascii=False)},
+                              files={"file": (filename, data, "application/octet-stream")}) as resp:
+                if resp.status_code == 401:
+                    resp.read()
+                    if attempt == 0 and _should_reauth(resp):
+                        continue
+                if resp.status_code >= 400:
+                    resp.read()
+                    _raise_for(resp)
+                for line in resp.iter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    event = json.loads(line[6:])
+                    if event.get("type") == "progress" and progress_key:
+                        with _ingest_progress_lock:
+                            cur = _ingest_progress.get(progress_key)
+                            if cur is not None:  # แทนทั้งชุด — ตัวเลขของขั้นก่อนหน้าไม่ค้าง
+                                _ingest_progress[progress_key] = {
+                                    "filename": cur["filename"], "started_at": cur.get("started_at"),
+                                    **{k: event[k] for k in _PROGRESS_FIELDS if k in event}}
+                    if event.get("type") == "result":
+                        return event
+                    if event.get("type") == "error":
+                        err = event.get("error") or {}
+                        add_usage(event.get("usage"))
+                        raise CentralError(502, err.get("code", "ingest_failed"), err.get("message", "ingest ไม่สำเร็จ"))
+        except httpx.HTTPError as e:
+            raise CentralError(502, "central_unreachable", f"ติดต่อ central ไม่ได้ ({type(e).__name__})")
+    raise CentralError(502, "ingest_failed", "central ปิดการเชื่อมต่อก่อนส่งผลลัพธ์")
+
+
+@app.post("/api/kb/{kb_id}/upload")
+def upload_to_kb(kb_id: str, file: UploadFile = File(...)):
+    kb = _get_kb(kb_id)
+    filename = _safe_filename(file.filename)
+    suffix = Path(filename).suffix.lower()
+    if suffix not in KB_ALLOWED:
+        raise HTTPException(400, f"รองรับเฉพาะ {', '.join(KB_ALLOWED)} เท่านั้น")
+    if (kb.get("embedding") or {}).get("model_id") not in load_settings()["registry"]:
+        raise HTTPException(409, "โมเดล embedding ของ Knowledge Base นี้ถูกลบไปแล้ว — สร้าง Knowledge Base ใหม่")
+    progress_key = f"{kb_id}/{filename}"
+    with _ingest_progress_lock:
+        if progress_key in _ingest_progress:
+            raise HTTPException(409, f"'{filename}' กำลังนำเข้าอยู่ — รอให้เสร็จก่อน (อัปโหลดซ้ำจะเสียค่า AI ซ้ำ)")
+        _ingest_progress[progress_key] = {"filename": filename, "stage": "uploading", "started_at": _now()}
+    try:
+        data = file.file.read()
+
+        # เก็บต้นฉบับไว้ที่ node (central ไม่เก็บ) เผื่อวันที่ต้อง re-index
+        folder = ORIGINALS_DIR / kb_id
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / filename).write_bytes(data)
+
+        result = _ingest_via_central(kb, filename, data, progress_key=progress_key)
+    finally:
+        with _ingest_progress_lock:
+            _ingest_progress.pop(progress_key, None)
+
+    with _db_lock:
+        kb = db_get("kbs", kb_id)
+        if kb:
+            kb["files"][filename] = {"size": len(data), "chunks": result.get("chunks", 0),
+                                     "chunk_types": result.get("chunk_types", {}), "uploaded_at": _now()}
+            kb["revision"] = kb.get("revision", 0) + 1
+            db_put("kbs", kb_id, kb)
+    add_usage(result.get("usage"))
+    return {
+        "message": f"อัปโหลด '{filename}' เข้า '{kb['name'] if kb else kb_id}' สำเร็จ",
+        "chunks": result.get("chunks", 0),
+        "chunk_types": result.get("chunk_types", {}),
+        "filename": filename,
+        "type": suffix.lstrip("."),
+    }
+
+
+@app.get("/api/kb/{kb_id}/ingest-progress")
+def kb_ingest_progress(kb_id: str):
+    """ไฟล์ที่กำลังนำเข้าใน KB นี้ (หน้าเว็บถามทุก ~2 วินาทีระหว่างอัปโหลด — เปิดหน้าใหม่ก็ยังเห็น)"""
+    prefix = f"{kb_id}/"
+    with _ingest_progress_lock:
+        items = [dict(v) for k, v in _ingest_progress.items() if k.startswith(prefix)]
+    return {"items": items}
+
+
+@app.delete("/api/kb/{kb_id}/files/{filename}")
+def delete_kb_file(kb_id: str, filename: str):
+    kb = _get_kb(kb_id)
+    filename = _safe_filename(filename)
+    if filename not in kb.get("files", {}):
+        raise HTTPException(404, "ไม่พบไฟล์")
+    central_json("/v1/kb/delete-source", {"ctx": _kb_ctx(kb), "kb": kb_payload(kb), "source": filename})
+    with _db_lock:
+        kb = db_get("kbs", kb_id)
+        if kb:
+            kb["files"].pop(filename, None)
+            kb["revision"] = kb.get("revision", 0) + 1
+            db_put("kbs", kb_id, kb)
+    (ORIGINALS_DIR / kb_id / filename).unlink(missing_ok=True)
+    return {"message": f"ลบ '{filename}' สำเร็จ"}
+
+
+@app.get("/api/kb/{kb_id}/files/{filename}/chunks")
+def get_kb_file_chunks(kb_id: str, filename: str):
+    kb = _get_kb(kb_id)
+    filename = _safe_filename(filename)
+    result = central_json("/v1/kb/chunks", {"ctx": _kb_ctx(kb), "kb": kb_payload(kb), "source": filename})
+    chunks = [{"id": c["id"], "text": c["text"], "length": len(c["text"]), "metadata": c["metadata"]}
+              for c in result.get("chunks", [])]
+    if not chunks:
+        raise HTTPException(404, f"ไม่พบ chunk ของ '{filename}'")
+
+    def sort_key(c):
+        m = c["metadata"]
+        order = {"parent": 0, "child": 1, "text": 2}.get(m.get("chunk_type", "zzz"), 9)
+        row = m.get("row_start") or m.get("row_id") or 0
+        return (order, row if isinstance(row, (int, float)) else 0)
+
+    chunks.sort(key=sort_key)
+    for i, c in enumerate(chunks):
+        c["index"] = i + 1
+    return {"filename": filename, "total_chunks": len(chunks), "chunks": chunks}
+
+
+# ══════════════════════════════════════════════
+# แหล่งข้อมูลสด (Realtime API) — node ดึง API ของลูกค้าเอง (key ไม่ออกนอกองค์กร) แล้วส่งแถวให้
+# central แปลงเป็น chunk ลง KB; central patch เฉพาะแถวที่ค่าเปลี่ยน ไม่ต้อง embed ใหม่ทั้งชุดทุกรอบ
+# ══════════════════════════════════════════════
+
+RT_METHODS = ("GET", "POST")
+RT_AUTH = ("none", "bearer", "api_key_header", "api_key_query")
+RT_MIN_INTERVAL = 60
+RT_MAX_RECORDS = 5000
+RT_FETCH_TIMEOUT = 20
+_rt_locks: dict[str, threading.Lock] = {}
+_rt_locks_guard = threading.Lock()
+
+
+class SourceIn(BaseModel):
+    name: str
+    url: str = ""  # โหมด push ไม่ต้องมี URL
+    # pull = node ดึงจาก API/ชีต/CSV ตามรอบ · push = แหล่งเก่าที่ระบบภายนอกเคยส่งแถวเข้ามา (ใหม่ไม่รับแล้ว — อยู่ใน n8n node)
+    mode: str = "pull"
+    method: str = "GET"
+    headers: dict = Field(default_factory=dict)
+    query_params: dict = Field(default_factory=dict)
+    body: dict = Field(default_factory=dict)
+    auth_type: str = "none"
+    auth_token: str | None = ""  # "" = ใช้ค่าเดิม (ตอนแก้ไข), null = ลบ
+    auth_header_name: str = ""
+    auth_query_param: str = ""
+    records_path: str = ""
+    poll_interval_sec: int = 300
+    # คอลัมน์ที่ส่งไปให้บอทใช้ (ว่าง = ทุกคอลัมน์) — เลือกเฉพาะที่จำเป็นช่วยลดค่า AI ตอนแชท และลดข้อมูลที่ออกนอกเครื่อง
+    fields: list[str] = Field(default_factory=list)
+    id: str | None = None  # ใช้ตอนทดสอบ: เอา token ที่บันทึกไว้มาใช้
+
+
+class SourceToggle(BaseModel):
+    enabled: bool
+
+
+def _rt_tag(sid: str) -> str:
+    # ใช้ id (ไม่ใช่ชื่อที่แก้ได้) เป็น metadata "source" ของทุก chunk — sync รอบหน้าหาของเก่าเจอเสมอ
+    return f"realtime:{sid}"
+
+
+def _rt_lock(sid: str) -> threading.Lock:
+    with _rt_locks_guard:
+        return _rt_locks.setdefault(sid, threading.Lock())
+
+
+def _validate_source(req: SourceIn) -> None:
+    if not req.name.strip():
+        raise HTTPException(400, "กรุณาตั้งชื่อแหล่งข้อมูล")
+    if req.mode != "pull":
+        raise HTTPException(400, "แหล่งข้อมูลต้องเป็นแบบดึงจาก URL (การรับข้อมูลที่ระบบภายนอกส่งมาอยู่ใน n8n node)")
+    if not re.match(r"^https?://", req.url.strip(), re.I):
+        raise HTTPException(400, "URL ต้องขึ้นต้นด้วย http:// หรือ https://")
+    if req.method.upper() not in RT_METHODS:
+        raise HTTPException(400, "รองรับเฉพาะ GET และ POST")
+    if req.auth_type not in RT_AUTH:
+        raise HTTPException(400, "รูปแบบการยืนยันตัวตนไม่ถูกต้อง")
+    if req.poll_interval_sec < RT_MIN_INTERVAL:
+        raise HTTPException(400, f"ตั้งรอบอัปเดตได้ต่ำสุด {RT_MIN_INTERVAL} วินาที")
+
+
+def _source_fields(req: SourceIn, old: dict | None = None) -> dict:
+    token = (old or {}).get("auth_token", "")
+    if req.auth_token is None:
+        token = ""
+    elif req.auth_token.strip():
+        token = _enc(req.auth_token.strip())
+    return {
+        "name": req.name.strip(), "mode": req.mode, "url": "" if req.mode == "push" else req.url.strip(),
+        "method": req.method.upper(),
+        "headers": req.headers or {}, "query_params": req.query_params or {}, "body": req.body or {},
+        "auth_type": req.auth_type, "auth_token": token if req.auth_type != "none" else "",
+        "auth_header_name": req.auth_header_name.strip(), "auth_query_param": req.auth_query_param.strip(),
+        "records_path": req.records_path.strip(), "poll_interval_sec": int(req.poll_interval_sec),
+        "fields": [f.strip() for f in req.fields if f and f.strip()],
+    }
+
+
+def _source_out(src: dict) -> dict:
+    out = {k: v for k, v in src.items() if k not in ("auth_token", "last_attempt_epoch", "has_data", "last_columns")}
+    out["auth_token"] = _mask(_dec(src.get("auth_token", "")))
+    out.setdefault("mode", "pull")
+    return out
+
+
+def _get_source(sid: str) -> dict:
+    src = db_get("sources", sid)
+    if not src:
+        raise HTTPException(404, "ไม่พบแหล่งข้อมูล")
+    return src
+
+
+def _walk_path(payload, path: str):
+    node = payload
+    for key in [k.strip() for k in (path or "").split(".") if k.strip()]:
+        if isinstance(node, dict) and key in node:
+            node = node[key]
+        elif isinstance(node, list) and key.isdigit() and int(key) < len(node):
+            node = node[int(key)]
+        else:
+            raise ValueError(f"ไม่พบ '{key}' ในข้อมูลที่ API ตอบมา — ตรวจช่อง ‘ตำแหน่งข้อมูล’")
+    return node
+
+
+_GSHEET_RE = re.compile(r"^https://docs\.google\.com/spreadsheets/d/([A-Za-z0-9_-]+)(/[^?#]*)?(\?[^#]*)?(#.*)?$")
+_CSV_NUM_RE = re.compile(r"^-?(?:0|[1-9]\d{0,2}(?:,\d{3})+|[1-9]\d*)(?:\.\d+)?$")
+
+
+def _sheet_csv_url(url: str) -> str:
+    """ลิงก์ Google Sheet แบบที่ก๊อปจากแถบที่อยู่ (…/edit#gid=123) → ลิงก์ส่งออก CSV ของแท็บนั้น
+    ลิงก์ที่เป็น CSV อยู่แล้ว (export / pub?output=csv / gviz) ปล่อยไว้ตามเดิม"""
+    m = _GSHEET_RE.match(url.strip())
+    if not m or m.group(1) == "e":  # /d/e/… = ลิงก์ ‘เผยแพร่ไปยังเว็บ’ ซึ่งเจ้าของเลือกรูปแบบมาเอง
+        return url
+    path, query, frag = m.group(2) or "", m.group(3) or "", m.group(4) or ""
+    if path.startswith(("/export", "/pub", "/gviz")):
+        return url
+    gid = re.search(r"gid=(\d+)", query + frag)
+    return f"https://docs.google.com/spreadsheets/d/{m.group(1)}/export?format=csv" + (f"&gid={gid.group(1)}" if gid else "")
+
+
+def _csv_value(v: str):
+    # ตัวเลขในชีตมาเป็นข้อความ ("1,250.50") — แปลงให้เหมือน API ที่ตอบ JSON เป็นตัวเลข
+    # รหัสที่ขึ้นต้นด้วย 0 (เช่น "00123") ไม่แปลง กันเลขศูนย์หน้ารหัสหาย
+    v = v.strip()
+    if _CSV_NUM_RE.match(v):
+        n = float(v.replace(",", ""))
+        return int(n) if n.is_integer() and "." not in v else n
+    return v
+
+
+def _parse_csv(text: str) -> list[dict]:
+    reader = csv.reader(io.StringIO(text.lstrip("﻿")))
+    header = next(reader, None)
+    if not header:
+        return []
+    cols = [(i, h.strip()) for i, h in enumerate(header) if h.strip()]
+    rows = []
+    for raw in reader:
+        row = {name: _csv_value(raw[i]) for i, name in cols if i < len(raw) and raw[i].strip()}
+        if row:
+            rows.append(row)
+    return rows
+
+
+def fetch_records(src: dict) -> list[dict]:
+    headers = {str(k): str(v) for k, v in (src.get("headers") or {}).items()}
+    params = {str(k): str(v) for k, v in (src.get("query_params") or {}).items()}
+    token = _dec(src.get("auth_token", ""))
+    auth = src.get("auth_type", "none")
+    if token and auth == "bearer":
+        headers["Authorization"] = f"Bearer {token}"
+    elif token and auth == "api_key_header":
+        headers[src.get("auth_header_name") or "X-API-Key"] = token
+    elif token and auth == "api_key_query":
+        params[src.get("auth_query_param") or "api_key"] = token
+    url = _sheet_csv_url(src["url"])
+    is_sheet = _GSHEET_RE.match(src["url"].strip()) is not None
+    try:
+        resp = httpx.request(src.get("method", "GET"), url, headers=headers, params=params,
+                             json=(src.get("body") or None) if src.get("method") == "POST" else None,
+                             timeout=RT_FETCH_TIMEOUT, follow_redirects=True)
+    except httpx.HTTPError as e:
+        raise ValueError(f"เรียก API ไม่ได้ ({type(e).__name__}) — ตรวจ URL และเครือข่าย")
+    if resp.status_code >= 400:
+        if is_sheet:
+            raise ValueError(f"Google Sheet ตอบ {resp.status_code} — ตั้งการแชร์เป็น ‘ทุกคนที่มีลิงก์ดูได้’ แล้วลองใหม่")
+        raise ValueError(f"API ตอบ {resp.status_code} — ตรวจ URL / การยืนยันตัวตน")
+    ctype = resp.headers.get("content-type", "").lower()
+    if "csv" in ctype:
+        records = _parse_csv(resp.text)
+        keep = src.get("fields") or []
+        return [{k: r[k] for k in keep if k in r} for r in records] if keep else records
+    if is_sheet:
+        # ชีตที่ยังไม่แชร์ Google จะตอบหน้า login (HTML) แทน CSV
+        raise ValueError("เปิด Google Sheet นี้ไม่ได้ — ตั้งการแชร์เป็น ‘ทุกคนที่มีลิงก์ดูได้’ แล้วลองใหม่")
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise ValueError("API ไม่ได้ตอบเป็น JSON หรือ CSV")
+    records = _walk_path(payload, src.get("records_path", ""))
+    if isinstance(records, dict):
+        # API บางตัวตอบเป็น object ก้อนเดียว — ถือเป็น 1 แถว
+        records = [records]
+    if not isinstance(records, list):
+        raise ValueError(f"ตำแหน่งข้อมูลต้องชี้ไปที่รายการ (list) แต่ได้ {type(records).__name__}")
+    rows = [r if isinstance(r, dict) else {"value": r} for r in records]
+    keep = src.get("fields") or []
+    if keep:
+        rows = [{k: r[k] for k in keep if k in r} for r in rows]
+    return rows
+
+
+def _apply_fields(src: dict, rows: list[dict]) -> list[dict]:
+    """เลือกเฉพาะคอลัมน์ที่ตั้งไว้ใน source (ว่าง = ทุกคอลัมน์) — ใช้กับแถวที่ส่งเข้ามาแบบ push"""
+    keep = src.get("fields") or []
+    return [{k: r[k] for k in keep if k in r} for r in rows] if keep else rows
+
+
+def _bump_kb_revision(kb_id: str) -> None:
+    with _db_lock:
+        kb = db_get("kbs", kb_id)
+        if kb:
+            kb["revision"] = kb.get("revision", 0) + 1
+            db_put("kbs", kb_id, kb)
+
+
+def _update_source(sid: str, patch: dict) -> dict | None:
+    with _db_lock:
+        src = db_get("sources", sid)
+        if not src:
+            return None
+        src.update(patch)
+        db_put("sources", sid, src)
+        return src
+
+
+RT_BRAKE_RATIO = 0.5  # แถว/คอลัมน์หายเกินสัดส่วนนี้ในรอบเดียว = น่าจะพลาด (ลบชีต วางทับ ลิงก์ผิดแท็บ)
+
+
+def _brake_reason(src: dict, records: list[dict]) -> str | None:
+    """เบรกกันพลาด: central สะท้อนต้นทางเสมอ (แม้ 0 แถว) ถ้าลูกค้าเผลอล้างชีต บอทจะลืมสินค้าทั้งหมดเงียบ ๆ
+    รอบที่ข้อมูลหายฮวบจึงพักไว้ก่อน — บอทใช้ข้อมูลเดิมต่อ จนกว่าต้นทางจะกลับมาปกติหรือแอดมินกดยืนยัน"""
+    prev = int(src.get("last_record_count") or 0)
+    if not src.get("has_data") or prev <= 0:
+        return None
+    tail = " — พักการอัปเดตไว้ บอทยังใช้ข้อมูลเดิม ตรวจต้นทาง หรือกด ‘ยืนยันใช้ข้อมูลใหม่’ ถ้าตั้งใจเปลี่ยนจริง"
+    if not records:
+        return f"ต้นทางส่งมา 0 แถว (รอบก่อน {prev:,} แถว){tail}"
+    if prev >= 4 and len(records) < prev * RT_BRAKE_RATIO:
+        return f"จำนวนแถวลดจาก {prev:,} เหลือ {len(records):,}{tail}"
+    prev_cols = set(src.get("last_columns") or [])
+    if prev_cols:
+        cols = set().union(*(r.keys() for r in records))
+        missing = sorted(prev_cols - cols)
+        if len(missing) > len(prev_cols) * RT_BRAKE_RATIO:
+            return f"คอลัมน์หายไป {len(missing)} จาก {len(prev_cols)} ({', '.join(missing[:5])}){tail}"
+    return None
+
+
+def sync_source(sid: str, force: bool = False, records: list[dict] | None = None) -> dict:
+    """ดึง API → ส่งให้ central → บันทึกสถานะ; คืนผล (ไม่ raise) ให้ทั้งปุ่ม ‘อัปเดตเดี๋ยวนี้’ และตัวจับเวลาใช้ร่วมกัน
+    force=True = แอดมินยืนยันแล้วว่าข้อมูลที่หายไปตั้งใจลบจริง (ข้ามเบรกรอบนี้รอบเดียว)
+    records = แถวที่ระบบภายนอกส่งมาเอง (โหมด push, เช่น n8n) แทนการดึงจาก URL — ผ่านเบรกกันพลาด/ขั้นตอนเดียวกันทุกอย่าง"""
+    lock = _rt_lock(sid)
+    if not lock.acquire(blocking=False):
+        return {"status": "busy", "error": "กำลังอัปเดตอยู่ — รอสักครู่"}
+    try:
+        src = db_get("sources", sid)
+        if not src:
+            return {"status": "error", "error": "ไม่พบแหล่งข้อมูล"}
+        _update_source(sid, {"last_attempt_epoch": time.time(), "syncing": True})
+        try:
+            kb = db_get("kbs", src["kb_id"])
+            if not kb:
+                raise ValueError("ไม่พบ Knowledge Base ของแหล่งข้อมูลนี้")
+            if (kb.get("embedding") or {}).get("model_id") not in load_settings()["registry"]:
+                raise ValueError("โมเดล embedding ของ Knowledge Base นี้ถูกลบไปแล้ว")
+            if records is None:
+                if src.get("mode") == "push":
+                    raise ValueError("แหล่งข้อมูลนี้รับข้อมูลที่ระบบภายนอกส่งเข้ามา (เช่น n8n) — ไม่ได้ดึงจาก URL")
+                records = fetch_records(src)
+            else:
+                records = _apply_fields(src, records)
+            if len(records) > RT_MAX_RECORDS:
+                raise ValueError(f"API ส่งมา {len(records)} แถว เกินที่รองรับ ({RT_MAX_RECORDS} แถว)")
+            held = None if force else _brake_reason(src, records)
+            if held:
+                updated = _update_source(sid, {"syncing": False, "last_synced_at": _now(), "last_status": "held",
+                                               "last_error": held, "held_record_count": len(records)})
+                return {"status": "held", "error": held, "record_count": len(records),
+                        "source": _source_out(updated) if updated else None}
+            res = central_json("/v1/ingest/records", {
+                "ctx": _kb_ctx(kb), "kb": kb_payload(kb),
+                # เคยดึงสำเร็จและต้นทางไม่ได้เปลี่ยน → patch ได้ (รอบที่ล้มชั่วคราวไม่ทำให้ต้องโหลดใหม่ทั้งชุด)
+                "source": {"name": _rt_tag(sid), "allow_incremental": bool(src.get("has_data"))},
+                "records": records,
+            })
+            add_usage(res.get("usage"))
+            if res.get("cache_invalidated"):
+                _bump_kb_revision(kb["id"])
+            patch = {"syncing": False, "has_data": True, "last_synced_at": _now(), "last_status": "success", "last_error": None,
+                     "last_record_count": len(records), "last_mode": res.get("mode"), "held_record_count": None,
+                     "last_columns": sorted(set().union(*(r.keys() for r in records)))[:200] if records else []}
+            if res.get("chunks") is not None:
+                patch["last_chunks"] = res["chunks"]
+            updated = _update_source(sid, patch)
+            return {"status": "success", "mode": res.get("mode"), "patched_rows": res.get("patched_rows", 0),
+                    "record_count": len(records), "source": _source_out(updated) if updated else None}
+        except (ValueError, CentralError) as e:
+            msg = e.message if isinstance(e, CentralError) else str(e)
+        except Exception as e:  # ไม่ให้ตัวจับเวลาตาย
+            msg = f"อัปเดตไม่สำเร็จ ({type(e).__name__})"
+        updated = _update_source(sid, {"syncing": False, "last_synced_at": _now(), "last_status": "error", "last_error": msg})
+        return {"status": "error", "error": msg, "source": _source_out(updated) if updated else None}
+    finally:
+        lock.release()
+
+
+def _realtime_loop() -> None:
+    """ตัวจับเวลาเบา ๆ ในเธรดเดียว: ทุก 15 วินาทีหาแหล่งที่ถึงรอบแล้ว sync ทีละตัว"""
+    while True:
+        time.sleep(15)
+        try:
+            now = time.time()
+            for src in db_all("sources"):
+                if (src.get("enabled") and src.get("mode") != "push"
+                        and now - float(src.get("last_attempt_epoch") or 0) >= int(src.get("poll_interval_sec") or 300)):
+                    sync_source(src["id"])
+        except Exception as e:
+            print(f"[realtime] loop error: {e}")
+
+
+def start_realtime_scheduler() -> None:
+    # รีสตาร์ตแล้วอย่าค้างสถานะ ‘กำลังอัปเดต’
+    for src in db_all("sources"):
+        if src.get("syncing"):
+            _update_source(src["id"], {"syncing": False})
+    threading.Thread(target=_realtime_loop, name="realtime-sync", daemon=True).start()
+
+
+@app.get("/api/kb/{kb_id}/sources")
+def list_sources(kb_id: str):
+    _get_kb(kb_id)
+    return {"sources": [_source_out(s) for s in db_all("sources") if s.get("kb_id") == kb_id]}
+
+
+@app.post("/api/kb/{kb_id}/sources")
+def create_source(kb_id: str, req: SourceIn):
+    _get_kb(kb_id)
+    _validate_source(req)
+    sid = _new_id()
+    src = {"id": sid, "kb_id": kb_id, **_source_fields(req), "enabled": req.mode == "push", "syncing": False,
+           "last_synced_at": None, "last_status": "never", "last_error": None, "last_record_count": 0,
+           "last_chunks": 0, "last_mode": None, "created_at": _now()}
+    db_put("sources", sid, src)
+    return _source_out(src)
+
+
+@app.put("/api/sources/{sid}")
+def update_source(sid: str, req: SourceIn):
+    old = _get_source(sid)
+    _validate_source(req)
+    changed_shape = any(old.get(k) != v for k, v in _source_fields(req, old).items()
+                        if k in ("mode", "url", "method", "records_path", "body", "query_params", "fields"))
+    src = {**old, **_source_fields(req, old)}
+    if changed_shape:
+        src["has_data"] = False  # ต้นทางเปลี่ยน — รอบหน้าโหลดใหม่ทั้งชุด ไม่ patch ทับของเก่า
+    db_put("sources", sid, src)
+    return _source_out(src)
+
+
+@app.delete("/api/sources/{sid}")
+def delete_source(sid: str):
+    src = _get_source(sid)
+    kb = db_get("kbs", src["kb_id"])
+    with _rt_lock(sid):
+        if kb:
+            central_json("/v1/kb/delete-source", {"ctx": _kb_ctx(kb), "kb": kb_payload(kb), "source": _rt_tag(sid)})
+            _bump_kb_revision(kb["id"])
+        db_delete("sources", sid)
+    return {"message": f"ลบแหล่งข้อมูล ‘{src['name']}’ และข้อมูลที่ดึงมาแล้ว"}
+
+
+@app.post("/api/sources/test")
+def test_source(req: SourceIn):
+    _validate_source(req)
+    old = db_get("sources", req.id) if req.id else None
+    try:
+        records = fetch_records({**_source_fields(req, old), "fields": []})
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    fields = sorted({k for r in records[:20] for k in r.keys()})
+    return {"total_records": len(records), "fields": fields, "sample": records[:3], "too_many": len(records) > RT_MAX_RECORDS}
+
+
+@app.post("/api/sources/{sid}/sync")
+def sync_now(sid: str, force: bool = False):
+    _get_source(sid)
+    return sync_source(sid, force=force)
+
+
+@app.patch("/api/sources/{sid}/toggle")
+def toggle_source(sid: str, req: SourceToggle):
+    _get_source(sid)
+    patch = {"enabled": req.enabled}
+    if req.enabled:
+        patch["last_attempt_epoch"] = 0  # เปิดแล้วอัปเดตรอบแรกทันที (ภายใน ~15 วินาที)
+    return _source_out(_update_source(sid, patch))
+
+
+@app.get("/api/sources/{sid}/chunks")
+def get_source_chunks(sid: str):
+    src = _get_source(sid)
+    return get_kb_file_chunks(src["kb_id"], _rt_tag(sid))
+
+
+# ══════════════════════════════════════════════
+# Skill Sets
+# ══════════════════════════════════════════════
+
+class SkillSetCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+
+
+def _preview_skills(text: str) -> list[dict]:
+    """แสดงรายชื่อสูตรในหน้าเว็บเท่านั้น (การจับคู่สูตรจริงทำที่ central ด้วย parser เต็ม)
+    ใช้กติกาเดียวกับ skill_engine.parse_skills: แยกด้วยหัวข้อ ### แล้วหา "สูตร:"/"Formula:" """
+    skills = []
+    for block in re.split(r"\n###\s+", text)[1:]:
+        lines = block.strip().split("\n")
+        if not lines:
+            continue
+        m = re.search(r"(?:สูตร|Formula)\s*[:：]\s*(.+)", block)
+        formula = m.group(1).strip() if m else ""
+        if formula:
+            skills.append({"name": lines[0].strip(), "formula": formula})
+    return skills
+
+
+def _file_skills(s: dict, name: str, content: str) -> tuple[list[dict], dict]:
+    """สูตรของไฟล์นี้: ผลที่ central อ่านไว้ (ตัวอ่านเดิมหรือ AI) ถ้ามี ไม่งั้นตัวอ่านรูปแบบเดิมในเครื่อง"""
+    c = (s.get("compiled") or {}).get(name)
+    if c and c.get("hash") == hashlib.sha256(content.encode("utf-8")).hexdigest()[:32]:
+        return [{**k, "file": name} for k in c.get("skills") or []], {"method": c.get("method"), "error": c.get("error")}
+    local = [{**k, "file": name} for k in _preview_skills(content)]
+    return local, {"method": "local", "error": None if local else "not_read"}
+
+
+def _skill_out(s: dict, detail: bool = False) -> dict:
+    files = s.get("files", {})
+    per = {n: _file_skills(s, n, c) for n, c in files.items()}
+    previews = [k for skills, _ in per.values() for k in skills]
+    out = {"id": s["id"], "name": s["name"], "description": s.get("description", ""),
+           "created_at": s.get("created_at", ""), "file_count": len(files), "skills_count": len(previews)}
+    if detail:
+        out["files"] = [{"name": n, "size": len(c.encode("utf-8")), "type": "md", **per[n][1], "skills_count": len(per[n][0])}
+                        for n, c in files.items()]
+        out["skills"] = previews
+    return out
+
+
+def _compile_skill_files(skill_id: str, names: list[str] | None = None) -> None:
+    """ให้ central อ่านไฟล์สูตร (รูปแบบเดิม หรือ AI อ่านเอกสารรูปแบบไหนก็ได้) แล้วเก็บผลไว้แสดง + ใช้ตอนแชท
+    (cache ของการอ่านส่งไปกับทุกคำถาม central จึงไม่อ่านซ้ำ) — ล้มก็เก็บสาเหตุไว้แสดง ไม่ทำให้อัปโหลดล้ม"""
+    sk = _get_skill(skill_id)
+    files = {n: c for n, c in sk.get("files", {}).items() if names is None or n in names}
+    if not files:
+        return
+    st = load_settings()
+    creds = {"llm": model_creds(st, resolve_model(st, "llm")[1])}
+    try:
+        res = central_json("/v1/skills/compile", {"ctx": {"credentials": creds, "cache": {"skill_compiled": sk.get("compiled_cache") or {}}},
+                                                  "files": [{"name": n, "content": c} for n, c in files.items()]})
+        results = {f["name"]: f for f in res.get("files") or []}
+        add_usage(res.get("usage"))
+        new_cache = (res.get("cache") or {}).get("skill_compiled") or {}
+    except CentralError as e:
+        results = {n: {"method": "ai", "error": f"ai_failed:{e.code}", "skills": []} for n in files}
+        new_cache = {}
+    with _db_lock:
+        sk = _get_skill(skill_id)
+        compiled = sk.setdefault("compiled", {})
+        for n, c in files.items():
+            if n in sk.get("files", {}) and n in results:
+                r = results[n]
+                compiled[n] = {"hash": hashlib.sha256(c.encode("utf-8")).hexdigest()[:32], "method": r.get("method"),
+                               "error": r.get("error"), "skills": r.get("skills") or []}
+        sk["compiled_cache"] = {**(sk.get("compiled_cache") or {}), **new_cache}
+        db_put("skills", skill_id, sk)
+
+
+def _get_skill(skill_id: str) -> dict:
+    s = db_get("skills", skill_id)
+    if not s:
+        raise HTTPException(404, "ไม่พบชุดสูตร")
+    return s
+
+
+@app.get("/api/skills")
+def list_skill_sets():
+    return {"skill_sets": [_skill_out(s) for s in db_all("skills")]}
+
+
+@app.post("/api/skills")
+def create_skill_set(req: SkillSetCreateRequest):
+    if not req.name.strip():
+        raise HTTPException(400, "กรุณาระบุชื่อชุดสูตร")
+    sid = _new_id()
+    s = {"id": sid, "name": req.name.strip(), "description": req.description.strip(),
+         "files": {}, "revision": 0, "created_at": _now()}
+    db_put("skills", sid, s)
+    return _skill_out(s)
+
+
+@app.get("/api/skills/{skill_id}")
+def get_skill_set(skill_id: str):
+    return _skill_out(_get_skill(skill_id), detail=True)
+
+
+@app.delete("/api/skills/{skill_id}")
+def delete_skill_set(skill_id: str):
+    _get_skill(skill_id)
+    db_delete("skills", skill_id)
+    for bot in db_all("bots"):
+        if skill_id in bot["skill_set_ids"]:
+            bot["skill_set_ids"] = [s for s in bot["skill_set_ids"] if s != skill_id]
+            db_put("bots", bot["id"], bot)
+    return {"message": "ลบชุดสูตรสำเร็จ"}
+
+
+@app.post("/api/skills/{skill_id}/upload")
+def upload_skill_file(skill_id: str, file: UploadFile = File(...)):
+    filename = _safe_filename(file.filename)
+    if not filename.lower().endswith(".md"):
+        raise HTTPException(400, "รองรับเฉพาะไฟล์ .md เท่านั้น")
+    content = file.file.read().decode("utf-8")
+    with _db_lock:
+        skill = _get_skill(skill_id)
+        skill["files"][filename] = content
+        skill["revision"] = skill.get("revision", 0) + 1
+        db_put("skills", skill_id, skill)
+    _compile_skill_files(skill_id, [filename])
+    found, status = _file_skills(_get_skill(skill_id), filename, content)
+    return {"message": f"อัปโหลด '{filename}' สำเร็จ", "skills_parsed": len(found), "filename": filename, **status}
+
+
+@app.post("/api/skills/{skill_id}/recompile")
+def recompile_skill_set(skill_id: str):
+    """อ่านไฟล์สูตรทั้งชุดใหม่ (เช่น หลังโควตา AI กลับมา หรือเปลี่ยนโมเดล)"""
+    _get_skill(skill_id)
+    with _db_lock:
+        sk = _get_skill(skill_id)
+        sk["compiled"], sk["compiled_cache"] = {}, {}
+        db_put("skills", skill_id, sk)
+    _compile_skill_files(skill_id)
+    return _skill_out(_get_skill(skill_id), detail=True)
+
+
+@app.delete("/api/skills/{skill_id}/files/{filename}")
+def delete_skill_file(skill_id: str, filename: str):
+    with _db_lock:
+        skill = _get_skill(skill_id)
+        if skill["files"].pop(_safe_filename(filename), None) is None:
+            raise HTTPException(404, "ไม่พบไฟล์")
+        (skill.get("compiled") or {}).pop(_safe_filename(filename), None)
+        skill["revision"] = skill.get("revision", 0) + 1
+        db_put("skills", skill_id, skill)
+    return {"message": f"ลบ '{filename}' สำเร็จ"}
+
+
+# ══════════════════════════════════════════════
+# Chatbots
+# ══════════════════════════════════════════════
+
+class BotCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+    kb_ids: list[str] = Field(default_factory=list)
+    skill_set_ids: list[str] = Field(default_factory=list)
+    system_prompt: str | None = None
+    use_rerank: bool = False
+    quick_chat_enabled: bool = False
+    quick_chat_tags: list[str] = Field(default_factory=list)
+    llm_model_id: str = ""      # ว่าง = ค่าเริ่มต้น
+    rerank_model_id: str = ""   # ว่าง = ค่าเริ่มต้น
+    # หน้าต้อนรับในหน้าแชท — ว่าง = ไม่แสดง (ข้อความต้อนรับว่าง → ใช้คำอธิบายบอท)
+    welcome_label: str = ""
+    welcome_message: str = ""
+    welcome_icon: str = "sparkles"
+    line_oa_id: str = ""   # ID ของ LINE OA ที่กรอกเอง (เช่น @abc1234) — ว่าง = ใช้ที่ดึงจาก LINE
+
+
+class BotUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    kb_ids: list[str] | None = None
+    skill_set_ids: list[str] | None = None
+    system_prompt: str | None = None
+    use_rerank: bool | None = None
+    quick_chat_enabled: bool | None = None
+    quick_chat_tags: list[str] | None = None
+    llm_model_id: str | None = None
+    rerank_model_id: str | None = None
+    welcome_label: str | None = None
+    welcome_message: str | None = None
+    welcome_icon: str | None = None
+    line_oa_id: str | None = None
+
+
+def stt_model_for(s: dict, bot: dict) -> dict | None:
+    """โมเดลถอดเสียงของบอท: STT ค่าเริ่มต้นในคลัง ไม่งั้นใช้ LLM ของบอทถ้าเป็น Gemini (ถอดเสียงได้ในตัว)
+    — LLM แบบ OpenAI-compatible ทั่วไปรับไฟล์เสียงไม่ได้ จึงไม่ใช้แทน"""
+    _, stt = resolve_model(s, "stt")
+    if stt:
+        return stt
+    _, llm = resolve_model(s, "llm", bot.get("llm_model_id"))
+    if llm and (s["providers"].get(llm.get("provider") or "") or {}).get("type") == "google":
+        return llm
+    return None
+
+
+def _enrich(bot: dict) -> dict:
+    kbs = {kb["id"]: kb for kb in db_all("kbs")}
+    skills = {s["id"]: s for s in db_all("skills")}
+    s = load_settings()
+    _, llm = resolve_model(s, "llm", bot.get("llm_model_id"))
+    _, rr = resolve_model(s, "rerank", bot.get("rerank_model_id"))
+    stt = stt_model_for(s, bot)
+    return {
+        **bot,
+        "llm_model_id": bot.get("llm_model_id") or "",
+        "rerank_model_id": bot.get("rerank_model_id") or "",
+        "welcome_label": bot.get("welcome_label") or "",
+        "welcome_message": bot.get("welcome_message") or "",
+        "welcome_icon": bot.get("welcome_icon") or "sparkles",
+        "llm_name": llm["name"] if llm else None,
+        "rerank_name": rr["name"] if rr else None,
+        "voice_input": {"available": bool(stt), "model_name": stt["name"] if stt else None},
+        "kb_names": [kbs[k]["name"] for k in bot["kb_ids"] if k in kbs],
+        "skill_set_names": [skills[s_]["name"] for s_ in bot["skill_set_ids"] if s_ in skills],
+        "line_oa_id": bot.get("line_oa_id") or "",
+        # ที่กรอกเองมาก่อน ถ้าไม่ได้กรอกใช้ ID ที่ดึงจาก LINE ของช่องทางที่เปิดใช้อยู่
+        "line_oa": ([{"basic_id": bot["line_oa_id"], "name": ""}] if bot.get("line_oa_id") else
+                    [{"basic_id": c["basic_id"], "name": c.get("account_name") or ""} for c in db_all("channels")
+                     if c.get("bot_id") == bot["id"] and c.get("enabled", True) and c.get("basic_id")]),
+    }
+
+
+def _validate_models(llm_id: str | None, rerank_id: str | None) -> None:
+    registry = load_settings()["registry"]
+    for mid, kind in ((llm_id, "llm"), (rerank_id, "rerank")):
+        if mid and (registry.get(mid) or {}).get("kind") != kind:
+            raise HTTPException(400, f"ไม่พบโมเดล {KIND_LABEL[kind]} ที่เลือก")
+
+
+def _validate_refs(kb_ids: list[str] | None, skill_ids: list[str] | None, tags: list[str] | None):
+    kbs = {kb["id"] for kb in db_all("kbs")}
+    skills = {s["id"] for s in db_all("skills")}
+    for k in kb_ids or []:
+        if k not in kbs:
+            raise HTTPException(400, f"ไม่พบ Knowledge Base '{k}'")
+    for s in skill_ids or []:
+        if s not in skills:
+            raise HTTPException(400, f"ไม่พบชุดสูตร '{s}'")
+    if tags is not None:
+        if len(tags) > QUICK_CHAT_MAX_TAGS:
+            raise HTTPException(400, f"Quick Chat ได้สูงสุด {QUICK_CHAT_MAX_TAGS} รายการ")
+        for t in tags:
+            if not t.strip():
+                raise HTTPException(400, "Quick Chat ห้ามเป็นข้อความว่างเปล่า")
+            if len(t) > QUICK_CHAT_MAX_TAG_LENGTH:
+                raise HTTPException(400, f"Quick Chat แต่ละรายการยาวได้ไม่เกิน {QUICK_CHAT_MAX_TAG_LENGTH} ตัวอักษร")
+
+
+def _get_bot(bot_id: str) -> dict:
+    bot = db_get("bots", bot_id)
+    if not bot:
+        raise HTTPException(404, "ไม่พบ Chatbot")
+    return bot
+
+
+_PUBLIC_BOT_FIELDS = ("id", "name", "description", "quick_chat_enabled", "quick_chat_tags", "welcome_label", "welcome_message",
+                      "welcome_icon", "voice_input", "line_oa", "line_oa_id")
+
+
+def _anonymous(request: Request) -> bool:
+    """คนที่ยังไม่ได้เข้าสู่ระบบแต่เปิดหน้าแชทสาธารณะได้ (scope=admin) — เห็นแค่สิ่งที่หน้าแชทต้องใช้ ไม่เห็นพรอมต์/โมเดล/KB"""
+    return _credentials_set() and not _authed(request)
+
+
+def _public_bot(bot: dict) -> dict:
+    return {k: bot[k] for k in _PUBLIC_BOT_FIELDS if k in bot}
+
+
+@app.get("/api/bots")
+def list_bots(request: Request):
+    bots = [_enrich(b) for b in db_all("bots")]
+    return {"bots": [_public_bot(b) for b in bots] if _anonymous(request) else bots}
+
+
+@app.get("/api/public/status")
+def public_status():
+    """ตั้งค่าครบพอให้หน้าแชทใช้ได้หรือยัง — ไม่มีข้อมูลลับ (หน้าแชทใช้ตัดสินใจว่าจะพาไปหน้าตั้งค่าครั้งแรกไหม)"""
+    st = setup_status()
+    return {"configured": bool(st["has_license"] and st["has_llm"] and st["has_embedding"])}
+
+
+@app.post("/api/bots")
+def create_bot(req: BotCreateRequest):
+    if not req.name.strip():
+        raise HTTPException(400, "กรุณาระบุชื่อ Chatbot")
+    _validate_refs(req.kb_ids, req.skill_set_ids, req.quick_chat_tags)
+    _validate_models(req.llm_model_id, req.rerank_model_id)
+    bid = _new_id()
+    bot = {
+        "id": bid, "name": req.name.strip(), "description": req.description.strip(),
+        "kb_ids": req.kb_ids, "skill_set_ids": req.skill_set_ids,
+        "system_prompt": req.system_prompt or DEFAULT_SYSTEM_PROMPT, "use_rerank": req.use_rerank,
+        "quick_chat_enabled": req.quick_chat_enabled, "quick_chat_tags": [t.strip() for t in req.quick_chat_tags],
+        "llm_model_id": req.llm_model_id, "rerank_model_id": req.rerank_model_id,
+        "welcome_label": req.welcome_label.strip(), "welcome_message": req.welcome_message.strip(),
+        "welcome_icon": req.welcome_icon.strip() or "sparkles",
+        "line_oa_id": _norm_line_id(req.line_oa_id),
+        "created_at": _now(), "last_chatted_at": None,
+    }
+    db_put("bots", bid, bot)
+    return _enrich(bot)
+
+
+@app.get("/api/bots/{bot_id}")
+def get_bot(bot_id: str, request: Request):
+    bot = _enrich(_get_bot(bot_id))
+    return _public_bot(bot) if _anonymous(request) else bot
+
+
+@app.put("/api/bots/{bot_id}")
+def update_bot(bot_id: str, req: BotUpdateRequest):
+    if req.line_oa_id is not None:
+        req.line_oa_id = _norm_line_id(req.line_oa_id)
+    _validate_refs(req.kb_ids, req.skill_set_ids, req.quick_chat_tags)
+    _validate_models(req.llm_model_id, req.rerank_model_id)
+    with _db_lock:
+        bot = _get_bot(bot_id)
+        for field, value in req.model_dump(exclude_none=True).items():
+            bot[field] = [t.strip() for t in value] if field == "quick_chat_tags" else value
+        db_put("bots", bot_id, bot)
+    db_delete("caches", bot_id)
+    return _enrich(bot)
+
+
+@app.delete("/api/bots/{bot_id}")
+def delete_bot(bot_id: str):
+    _get_bot(bot_id)
+    db_delete("bots", bot_id)
+    db_delete("caches", bot_id)
+    return {"message": "ลบ Chatbot สำเร็จ"}
+
+
+def _cache_stamp(bot: dict) -> dict:
+    kbs = {kb["id"]: kb for kb in db_all("kbs")}
+    skills = {s["id"]: s for s in db_all("skills")}
+    return {
+        "kbs": {k: kbs[k].get("revision", 0) for k in bot["kb_ids"] if k in kbs},
+        "skills": {s: skills[s].get("revision", 0) for s in bot["skill_set_ids"] if s in skills},
+        "embeddings": {k: (kbs[k].get("embedding") or {}).get("model_id") for k in bot["kb_ids"] if k in kbs},
+    }
+
+
+def clean_history(raw) -> list[dict]:
+    """ประวัติแชทจากหน้าเว็บ — ตรวจรูปแบบ/ขนาดก่อนส่งต่อ (central ตรวจซ้ำอีกชั้น)"""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw) if raw.strip() else []
+        except ValueError:
+            return []
+    out = []
+    for h in (raw if isinstance(raw, list) else [])[-6:]:
+        if isinstance(h, dict) and h.get("role") in ("user", "assistant") and str(h.get("text") or "").strip():
+            out.append({"role": h["role"], "text": str(h["text"])[:600]})
+    return out
+
+
+def _chat_payload(bot: dict, message: str, stamp: dict, history: list | None = None) -> dict:
+    s = load_settings()
+    kb_rows = [kb for k in bot["kb_ids"] if (kb := db_get("kbs", k))]
+    kbs = [kb_payload(kb, s) for kb in kb_rows]
+    # ห้ามใช้ชื่อ s ใน walrus — มันรั่วออกมาทับตัวแปร settings ของฟังก์ชันนี้ (บอทที่มีชุดสูตรเคยแชทไม่ได้เพราะเหตุนี้)
+    skills = [{"id": sk["id"], "name": sk["name"], "files": [{"name": n, "content": c} for n, c in sk["files"].items()]}
+              for i in bot["skill_set_ids"] if (sk := db_get("skills", i))]
+    cached = db_get("caches", bot["id"]) or {}
+    cache = dict(cached.get("data") or {}) if cached.get("stamp") == stamp else {}
+    compiled = {}
+    for i in bot["skill_set_ids"]:
+        compiled.update((db_get("skills", i) or {}).get("compiled_cache") or {})
+    if compiled:  # ผลการอ่านไฟล์สูตรที่ทำไว้ตอนอัปโหลด — central ไม่ต้องอ่านซ้ำ
+        cache["skill_compiled"] = {**(cache.get("skill_compiled") or {}), **compiled}
+    return {
+        # embedding ระดับ request = ของ KB แรก (central รุ่นเก่าใช้ตัวนี้ตัวเดียว) — central รุ่นใหม่ใช้ credentials ต่อ KB
+        "ctx": {"credentials": credentials(s, llm_id=bot.get("llm_model_id"), rerank_id=bot.get("rerank_model_id"),
+                                           use_rerank=bool(bot.get("use_rerank")),
+                                           embedding_id=((kb_rows[0].get("embedding") or {}).get("model_id") if kb_rows else None)),
+                "cache": cache or {}},
+        "bot": {"system_prompt": bot.get("system_prompt", ""), "use_rerank": bot.get("use_rerank", False),
+                "kbs": kbs, "skills": skills},
+        "message": message,
+        **({"history": history} if history else {}),
+    }
+
+
+def _save_export(export: dict) -> dict:
+    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    eid = _new_id()
+    path = EXPORTS_DIR / f"{eid}.{export['format']}"
+    path.write_bytes(base64.b64decode(export["content_base64"]))
+    db_put("exports", eid, {"filename": export["filename"], "mime": export.get("mime"), "path": path.name, "created_at": _now()})
+    return {"id": eid, "format": export["format"], "title": export.get("title"), "filename": export["filename"],
+            "download_url": f"/api/exports/{eid}/download"}
+
+
+def _after_done(bot_id: str, stamp: dict, event: dict) -> dict:
+    """เก็บ cache/usage ที่ central ส่งกลับ แล้วคืน event ที่ส่งต่อให้หน้าเว็บ (ไม่มี cache)"""
+    if "cache" in event:
+        db_put("caches", bot_id, {"stamp": stamp, "data": event.pop("cache")})
+    add_usage(event.get("usage"))
+    with _db_lock:
+        bot = db_get("bots", bot_id)
+        if bot:
+            bot["last_chatted_at"] = _now()
+            db_put("bots", bot_id, bot)
+    if event.get("export"):
+        event["export"] = _save_export(event["export"])
+    return event
+
+
+async def _read_file_part(file: UploadFile | None):
+    if file is None:
+        return None
+    return {"file": (file.filename or "attachment", await file.read(), file.content_type or "application/octet-stream")}
+
+
+@app.post("/api/bots/{bot_id}/chat/stream")
+async def chat_stream(bot_id: str, message: str = Form(...), history: str = Form(""), file: UploadFile | None = File(None)):
+    bot = _get_bot(bot_id)
+    stamp = _cache_stamp(bot)
+    payload = _chat_payload(bot, message, stamp, clean_history(history))
+    file_part = await _read_file_part(file)
+    url, _ = _central()
+
+    def sse(event: dict) -> str:
+        return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    async def gen():
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT, verify=CENTRAL_VERIFY) as client:
+                for attempt in range(2):
+                    token = get_token(force=attempt > 0)
+                    async with client.stream("POST", f"{url}/v1/chat/stream",
+                                             headers={"Authorization": f"Bearer {token}"},
+                                             data={"payload": json.dumps(payload, ensure_ascii=False)},
+                                             files=file_part) as resp:
+                        if resp.status_code == 401:
+                            await resp.aread()
+                            if attempt == 0 and _should_reauth(resp):
+                                continue
+                        if resp.status_code >= 400:
+                            await resp.aread()
+                            _raise_for(resp)
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            event = json.loads(line[6:])
+                            if event.get("type") == "done":
+                                event = _after_done(bot_id, stamp, event)
+                            yield sse(event)
+                    break
+        except CentralError as e:
+            yield sse({"type": "error", "error": {"code": e.code, "message": e.message}})
+            yield sse({"type": "done", "used_skill": False})
+        except httpx.HTTPError as e:
+            yield sse({"type": "error", "error": {"code": "central_unreachable", "message": f"ติดต่อ central ไม่ได้ ({type(e).__name__})"}})
+            yield sse({"type": "done", "used_skill": False})
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/api/bots/{bot_id}/chat")
+async def chat(bot_id: str, message: str = Form(...), history: str = Form(""), file: UploadFile | None = File(None)):
+    bot = _get_bot(bot_id)
+    stamp = _cache_stamp(bot)
+    payload = _chat_payload(bot, message, stamp, clean_history(history))
+    file_part = await _read_file_part(file)
+    url, _ = _central()
+    async with httpx.AsyncClient(timeout=TIMEOUT, verify=CENTRAL_VERIFY) as client:
+        for attempt in range(2):
+            resp = await client.post(f"{url}/v1/chat", headers={"Authorization": f"Bearer {get_token(force=attempt > 0)}"},
+                                     data={"payload": json.dumps(payload, ensure_ascii=False)}, files=file_part)
+            if attempt == 0 and _should_reauth(resp):
+                continue
+            break
+    _raise_for(resp)
+    body = _after_done(bot_id, stamp, resp.json())
+    return {k: body[k] for k in ("reply", "used_skill", "export") if k in body}
+
+
+STT_LANGUAGE_RE = re.compile(r"^[a-z]{2,3}(-[A-Za-z]{2,4})?$")
+
+
+@app.post("/api/bots/{bot_id}/transcribe")
+async def transcribe(bot_id: str, file: UploadFile = File(...), language: str = Form("")):
+    """ถอดเสียงจากปุ่มไมค์ในหน้าแชท — ส่งเสียงให้ central พร้อมโมเดลของเรา (central ไม่มีโมเดลเอง)
+    ได้ข้อความกลับมาใส่ช่องพิมพ์ ผู้ใช้ตรวจ/แก้ก่อนกดส่งเอง (ไม่ส่งเข้าแชทอัตโนมัติ)"""
+    bot = _get_bot(bot_id)
+    s = load_settings()
+    model = stt_model_for(s, bot)
+    if not model:
+        raise HTTPException(400, "ยังไม่มีโมเดลถอดเสียง — เพิ่ม Speech-to-Text ในหลังบ้าน → การเชื่อมต่อ AI หรือใช้ LLM ที่เป็น Gemini")
+    language = language.strip()
+    payload = {"ctx": {"credentials": {"stt": model_creds(s, model)}},
+               "language": language if STT_LANGUAGE_RE.match(language) else None}
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "ไม่ได้ยินเสียง ลองอัดใหม่อีกครั้ง")
+    file_part = {"file": (file.filename or "voice.wav", data, file.content_type or "audio/wav")}
+    url, _ = _central(s)
+    async with httpx.AsyncClient(timeout=TIMEOUT, verify=CENTRAL_VERIFY) as client:
+        for attempt in range(2):
+            try:
+                resp = await client.post(f"{url}/v1/stt", headers={"Authorization": f"Bearer {get_token(force=attempt > 0, settings=s)}"},
+                                         data={"payload": json.dumps(payload, ensure_ascii=False)}, files=file_part)
+            except httpx.HTTPError as e:
+                raise CentralError(502, "central_unreachable", f"ติดต่อ central ไม่ได้ ({type(e).__name__})")
+            if attempt == 0 and _should_reauth(resp):
+                continue
+            break
+    _raise_for(resp)
+    body = resp.json()
+    add_usage(body.get("usage"))
+    return {"text": body.get("text") or ""}
+
+
+@app.get("/api/exports/{export_id}/download")
+def download_export(export_id: str):
+    rec = db_get("exports", export_id)
+    if not rec:
+        raise HTTPException(404, "ไม่พบไฟล์")
+    return FileResponse(EXPORTS_DIR / rec["path"], filename=rec["filename"], media_type=rec.get("mime") or "application/octet-stream")
+
+
+# ══════════════════════════════════════════════
+# หน้าตั้งค่าครั้งแรก — ลูกค้าตั้งเองได้ครบในเบราว์เซอร์ ไม่ต้องแก้ .env
+# ══════════════════════════════════════════════
+
+
+
+def setup_status(s: dict | None = None) -> dict:
+    s = s or load_settings()
+    has_license = bool(s["central"].get("license_key"))
+    _, llm = resolve_model(s, "llm")
+    _, emb = resolve_model(s, "embedding")
+
+    def keyed(entry):
+        prov = (s["providers"].get((entry or {}).get("provider") or "") or {})
+        return bool(entry) and (bool(prov.get("api_key")) or prov.get("type") == "ollama")
+
+    has_password = bool(NODE_PASSWORD or (s.get("setup") or {}).get("password_hash"))
+    needs = not (has_license and keyed(llm) and keyed(emb))
+    return {"needs_setup": (not has_password) or (needs and not (s.get("setup") or {}).get("completed")),
+            "has_license": has_license, "has_llm": keyed(llm), "has_embedding": keyed(emb),
+            "has_password": has_password, "password_from_env": bool(NODE_PASSWORD),
+            "central_url": s["central"].get("url", ""), "admin_user": NODE_USER}
+
+
+_program_cache: dict = {"at": 0.0, "value": None}
+
+
+def central_program(s: dict | None = None) -> dict | None:
+    """central แจกอะไรอยู่ตอนนี้ (Free Beta หรือทดลอง N ชม.) — จำไว้ 60 วินาที · ติดต่อไม่ได้ = None"""
+    if time.time() - _program_cache["at"] < 60:
+        return _program_cache["value"]
+    url = (s or load_settings())["central"].get("url", "")
+    value = None
+    if url:
+        try:
+            resp = httpx.get(f"{url}/v1/program", timeout=5, verify=CENTRAL_VERIFY)
+            value = resp.json() if resp.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            value = None
+    _program_cache.update(at=time.time(), value=value)
+    return value
+
+
+@app.get("/api/admin/setup")
+def get_setup():
+    return {**setup_status(), "program": central_program()}
+
+
+@app.get("/api/admin/notice")
+def admin_notice():
+    """แถบแจ้งเตือนบนหลังบ้าน: Free Beta ใกล้จบ / จบแล้ว — คืนแค่รหัสกับวันที่ ข้อความอยู่ในไฟล์ภาษาของหน้าเว็บ"""
+    s = load_settings()
+    if not s["central"].get("license_key"):
+        return {"notice": None, "tasks": None}
+    try:
+        info = live_license(s)
+    except CentralError as e:
+        return {"notice": {"code": "beta_ended"} if e.code == "beta_ended" else None, "tasks": None}
+    # free tier: tasks used today / daily limit / unlimited window (numbers only — the wording lives in the web UI's language files)
+    tasks = (info.get("license") or {}).get("tasks")
+    for w in info.get("warnings") or []:
+        if w.get("code") == "beta_ending":
+            return {"notice": {"code": "beta_ending", "ends_at": w.get("ends_at")}, "tasks": tasks}
+    return {"notice": None, "tasks": tasks}
+
+
+_AI_ERROR_KIND = {"provider_quota_exhausted": "ai_quota", "credential_invalid": "ai_key"}
+
+
+@app.get("/api/admin/alerts")
+def admin_alerts():
+    """เตือนเจ้าของร้านเชิงรุกบนทุกหน้าหลังบ้าน — เรื่องที่ทำให้บอทตอบผิด/ไม่ตอบโดยเจ้าของไม่รู้ตัว
+    คืนแค่รหัส + ชื่อ + รายละเอียด ข้อความและวิธีแก้อยู่ในไฟล์ภาษาของหน้าเว็บ"""
+    alerts = []
+    for s in db_all("sources"):
+        if s.get("last_status") == "held":
+            alerts.append({"code": "source_held", "name": s.get("name", "")})
+        elif s.get("enabled") and s.get("last_status") == "error":
+            alerts.append({"code": "source_error", "name": s.get("name", ""), "detail": s.get("last_error") or ""})
+    for ch in db_all("channels"):
+        err = ch.get("last_error")
+        if err and ch.get("enabled", True):
+            m = re.match(r"\[(\w+)\]\s*", err)
+            missed = ch.get("missed") or {}
+            if m and m.group(1) == "task_limit":
+                if missed.get("day") == _thai_day():
+                    alerts.append({"code": "task_limit_missed", "name": ch.get("account_name") or "", "count": int(missed.get("n") or 0)})
+                continue
+            alerts.append({"code": _AI_ERROR_KIND.get(m.group(1) if m else "", "line_error"),
+                           "name": ch.get("account_name") or "", "detail": err[m.end():] if m else err})
+    return {"alerts": alerts}
+
+
+def _save_license(key: str) -> None:
+    s = load_settings()
+    _update_settings(central={**s["central"], "license_key": key.strip()})
+    with _token_lock:
+        _tokens.clear()
+    _set_license_displaced(False)
+
+
+@app.post("/api/admin/setup/demo")
+def setup_demo(body: dict = Body(...)):
+    """ขอทดลองใช้ฟรีจาก central (ผูกกับเครื่องนี้) แล้วบันทึก key ให้เลย"""
+    url, _ = _central()
+    try:
+        resp = httpx.post(f"{url}/v1/demo/start", json={"email": str(body.get("email") or ""), "install_id": install_id()},
+                          timeout=20, verify=CENTRAL_VERIFY)
+    except httpx.HTTPError as e:
+        raise CentralError(502, "central_unreachable", f"ติดต่อ central ไม่ได้ ({type(e).__name__})")
+    _raise_for(resp)
+    _save_license(resp.json()["license_key"])
+    get_token(force=True)
+    return {**setup_status(), "license_type": resp.json().get("license_type"), "demo_hours": resp.json().get("demo_hours")}
+
+
+@app.post("/api/admin/setup/license")
+def setup_license(body: dict = Body(...)):
+    key = str(body.get("license_key") or "").strip()
+    if not key:
+        raise HTTPException(400, "ใส่ license key")
+    old = load_settings()["central"].get("license_key", "")
+    _save_license(key)
+    try:
+        get_token(force=True)
+    except CentralError:
+        _save_license(old)  # key ใช้ไม่ได้ — คืนค่าเดิม ไม่ทิ้งเครื่องไว้กับ key เสีย
+        raise
+    return setup_status()
+
+
+def _upsert_provider(s: dict, name: str, typ: str, base_url: str, api_key: str) -> str:
+    for pid, p in s["providers"].items():
+        if p.get("type") == typ and (p.get("base_url") or "").rstrip("/") == base_url.rstrip("/"):
+            s["providers"][pid] = {**p, "api_key": api_key}
+            return pid
+    pid = "p_" + _new_id()[:8]
+    s["providers"][pid] = {"name": name, "type": typ, "base_url": base_url, "api_key": api_key}
+    return pid
+
+
+def _upsert_model(s: dict, kind: str, provider: str, model: str, dim: int | None = None) -> str:
+    for mid, e in s["registry"].items():
+        if e["kind"] == kind and e.get("provider") == provider and e["model"] == model and (kind != "embedding" or e.get("dim") == dim):
+            break
+    else:
+        mid = f"m_{_new_id()[:8]}"
+        s["registry"][mid] = {"name": model, "kind": kind, "provider": provider, "model": model, **({"dim": dim} if dim else {})}
+    s["defaults"][kind] = mid
+    return mid
+
+
+def _setup_endpoint(item: dict | None) -> tuple[str, str, str, str] | None:
+    """URL + key + ชื่อโมเดล จากหน้าตั้งค่า → (type, url, key, model) · None ถ้าไม่ได้กรอกเลย (เช่น rerank ที่ไม่บังคับ)"""
+    item = item or {}
+    url, key, model = (str(item.get(k) or "").strip() for k in ("base_url", "api_key", "model"))
+    if not (url or key or model):
+        return None
+    typ = detect_type(url)  # URL ว่าง = แบบที่ไม่ต้องใช้ URL (ระบุด้วย key อย่างเดียว)
+    if not model or (typ != "ollama" and not key):
+        raise HTTPException(400, "[setup_ai_incomplete] ใส่ API key และเลือกโมเดลให้ครบ")
+    return typ, url, key, model
+
+
+@app.post("/api/admin/setup/discover")
+def setup_discover(body: dict = Body(...)):
+    """ดึงรายชื่อโมเดลจาก URL + key ที่กรอก (ยังไม่บันทึก) ให้หน้าตั้งค่าครั้งแรกเลือกแทนการพิมพ์ชื่อเอง
+    คืนแต่ละโมเดลพร้อมประเภทที่ใช้ได้ (llm / embedding / rerank / stt)"""
+    url, key = str(body.get("base_url") or "").strip(), str(body.get("api_key") or "").strip()
+    typ = detect_type(url)
+    if typ != "ollama" and not key:
+        raise HTTPException(400, "[setup_discover_no_key] ใส่ API key ก่อน")
+    return {"type": typ, "models": list_provider_models({"type": typ, "base_url": url, "api_key": key})}
+
+
+@app.post("/api/admin/setup/ai")
+def setup_ai(body: dict = Body(...)):
+    """ตั้ง LLM + embedding (+ rerank ถ้ากรอก) จาก URL/key/ชื่อโมเดลที่ผู้ใช้ใส่ — ไม่มีผู้ให้บริการหรือโมเดลตั้งไว้ให้
+    ตรวจผ่าน central ก่อนบันทึก (ถ้าตรวจไม่ผ่านจะไม่บันทึกอะไรเลย)"""
+    llm = _setup_endpoint(body.get("llm"))
+    emb = _setup_endpoint(body.get("embedding"))
+    if llm is None or emb is None:
+        raise HTTPException(400, "[setup_ai_incomplete] ใส่ URL ของ API, API key และชื่อโมเดลให้ครบ")
+    rr = _setup_endpoint(body.get("rerank"))
+    s = json.loads(json.dumps(load_settings()))
+
+    def provider(ep):
+        typ, url, key, _ = ep
+        return _upsert_provider(s, urlparse(url).hostname or url or typ, typ, url, key)
+
+    p_llm, p_emb = provider(llm), provider(emb)
+    creds = {"llm": model_creds(s, {"provider": p_llm, "model": llm[3]}),
+             "embedding": model_creds(s, {"provider": p_emb, "model": emb[3]}),
+             "vector": vector_creds(s)}
+    if rr:
+        creds["rerank"] = {"api_key": rr[2], "model": rr[3], "base_url": rr[1], "params": {}}
+    check = central_json("/v1/credentials/check", {"ctx": {"credentials": creds}})
+    for kind in ("llm", "embedding") + (("rerank",) if rr else ()):
+        if not (check.get(kind) or {}).get("ok"):
+            item = check.get(kind) or {}
+            raise CentralError(422, item.get("error_code") or "credential_invalid",
+                               f"{kind}: {item.get('message') or 'ตรวจไม่ผ่าน'}")
+    dim = int((check.get("embedding") or {}).get("dim") or 0)
+    _upsert_model(s, "llm", p_llm, llm[3])
+    _upsert_model(s, "embedding", p_emb, emb[3], dim or None)
+    if rr:
+        _upsert_model(s, "rerank", provider(rr), rr[3])
+    _write_settings(s)
+    return {**setup_status(), "embedding_dim": dim}
+
+
+@app.post("/api/admin/setup/password")
+def setup_password(request: Request, body: dict = Body(...)):
+    if NODE_PASSWORD:
+        raise HTTPException(409, "รหัสผ่านถูกกำหนดจากไฟล์ตั้งค่าของเครื่อง (NODE_PASSWORD) — แก้ที่นั่น")
+    pw = str(body.get("password") or "")
+    if len(pw) < 8:
+        raise HTTPException(400, "รหัสผ่านต้องยาวอย่างน้อย 8 ตัวอักษร")
+    s = load_settings()
+    _update_settings(setup={**(s.get("setup") or {}), "password_hash": _hash_password(pw)})
+    resp = JSONResponse(setup_status())
+    _set_session_cookie(resp, request)
+    return resp
+
+
+@app.post("/api/admin/setup/finish")
+def setup_finish():
+    s = load_settings()
+    _update_settings(setup={**(s.get("setup") or {}), "completed": True})
+    return setup_status()
+
+
+# ══════════════════════════════════════════════
+# ช่องทางสนทนา: LINE Official Account (หลังบ้าน)
+# ══════════════════════════════════════════════
+
+def _public_channel(row: dict, tenant_id: str | None, central_url: str) -> dict:
+    cid = row["id"]
+    return {
+        "id": cid, "kind": "line", "bot_id": row.get("bot_id"), "enabled": row.get("enabled", True),
+        "welcome": row.get("welcome", True), "account_name": row.get("account_name") or "",
+        "basic_id": row.get("basic_id") or "",
+        "secret": _mask(_dec(row.get("channel_secret", ""))), "token": _mask(_dec(row.get("access_token", ""))),
+        "webhook_url": f"{central_url}/v1/line/webhook/{tenant_id}/{cid}" if tenant_id and central_url else None,
+        "last_event_at": row.get("last_event_at"), "last_error": row.get("last_error"),
+        "messages_total": int(row.get("messages_total") or 0), "created_at": row.get("created_at"),
+    }
+
+
+def _tenant_id() -> str | None:
+    try:
+        get_token()
+        return (token_info() or {}).get("tenant_id")
+    except CentralError:
+        return None
+
+
+_line_token_cache: dict[str, tuple[float, str]] = {}
+
+
+def _line_token_state(row: dict) -> str:
+    """access token ของช่องทางใช้กับ LINE ได้ไหม: ok / invalid / unreachable (จำผล 5 นาที ถ้าไม่ผ่านจำ 1 นาที)
+    ไฟ "เชื่อมต่อแล้ว" ของท่อไม่ได้บอกเรื่องนี้ — token ผิด LINE จะตอบลูกค้าไม่ได้เลย
+    ผ่านแล้วเก็บชื่อบัญชี + basic ID ด้วย ปุ่มเพิ่มเพื่อนในหน้าแชทจึงขึ้นเองหลังแก้ token"""
+    token = ((_channel_secrets(row) or {}).get("access_token") or "").strip()
+    if not token:
+        return "invalid"
+    key = f'{row["id"]}:{hashlib.sha256(token.encode()).hexdigest()[:16]}'
+    hit = _line_token_cache.get(key)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    try:
+        info = line_channel.fetch_bot_info(token)
+        state = "ok"
+    except ValueError as e:
+        info, state = None, ("unreachable" if isinstance(e.__cause__, httpx.HTTPError) else "invalid")
+    _line_token_cache[key] = (time.time() + (300 if state == "ok" else 60), state)
+    if info:
+        found = {"account_name": str(info.get("displayName") or info.get("basicId") or ""), "basic_id": str(info.get("basicId") or "")}
+        with _db_lock:
+            cur = db_get("channels", row["id"])
+            if cur and found["basic_id"] and any(cur.get(k) != v for k, v in found.items()):
+                cur.update(found)
+                db_put("channels", row["id"], cur)
+    return state
+
+
+@app.get("/api/admin/channels")
+def list_channels():
+    url, _ = _central(check=False)
+    tid = _tenant_id()
+    channels = []
+    for r in db_all("channels"):
+        state = _line_token_state(r)
+        channels.append({**_public_channel(db_get("channels", r["id"]) or r, tid, url), "token_state": state})
+    return {"channels": channels, "tunnel": TUNNEL.state, "central_url": url, "central_https": url.startswith("https://")}
+
+
+class ChannelIn(BaseModel):
+    bot_id: str
+    channel_secret: str | None = ""   # "" = ใช้ค่าเดิม (ตอนแก้ไข)
+    access_token: str | None = ""
+    enabled: bool = True
+    welcome: bool = True
+
+
+def _validate_channel_bot(bot_id: str) -> None:
+    if not db_get("bots", bot_id):
+        raise HTTPException(404, "ไม่พบ Chatbot")
+
+
+def _norm_line_id(value: str | None) -> str:
+    """ID ของ LINE OA ที่กรอกเอง — เติม @ ให้ถ้าลืม ว่าง = ล้างค่า"""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    if not v.startswith("@"):
+        v = "@" + v
+    if not re.fullmatch(r"@[A-Za-z0-9._-]{1,40}", v):
+        raise HTTPException(400, "ID ของ LINE OA ไม่ถูกต้อง (ตัวอย่าง: @abc1234)")
+    return v
+
+
+def _fetch_line_info(token: str) -> dict:
+    """ตรวจ token กับ LINE แล้วคืนชื่อบัญชี + basic ID (@xxxx — ข้อมูลสาธารณะ ใช้โชว์ให้คนเพิ่มเพื่อนได้)"""
+    try:
+        info = line_channel.fetch_bot_info(token)
+    except ValueError as e:
+        raise HTTPException(422, f"[credential_invalid] {e}")
+    return {"account_name": str(info.get("displayName") or info.get("basicId") or ""),
+            "basic_id": str(info.get("basicId") or "")}
+
+
+def _fetch_line_name(token: str) -> str:
+    return _fetch_line_info(token)["account_name"]
+
+
+def _backfill_line_ids() -> None:
+    """ช่องทางที่สร้างก่อนมีการเก็บ basic ID — ถาม LINE ครั้งเดียวตอนเริ่มระบบ (พลาดก็ข้าม ไม่กระทบอย่างอื่น)"""
+    for row in db_all("channels"):
+        if row.get("basic_id"):
+            continue
+        try:
+            sec = _channel_secrets(row)
+            info = _fetch_line_info(sec["access_token"]) if sec and sec.get("access_token") else None
+        except Exception:
+            continue
+        if info and info["basic_id"]:
+            with _db_lock:
+                cur = db_get("channels", row["id"])
+                if cur:
+                    cur.update(info)
+                    db_put("channels", row["id"], cur)
+
+
+@app.post("/api/admin/channels")
+def create_channel(req: ChannelIn):
+    _validate_channel_bot(req.bot_id)
+    secret, token = (req.channel_secret or "").strip(), (req.access_token or "").strip()
+    if not secret or not token:
+        raise HTTPException(400, "ใส่ Channel secret และ Channel access token ให้ครบ")
+    info = _fetch_line_info(token)
+    cid = "ch_" + secrets.token_hex(8)
+    db_put("channels", cid, {"id": cid, "kind": "line", "bot_id": req.bot_id, "channel_secret": _enc(secret),
+                             "access_token": _enc(token), "enabled": req.enabled, "welcome": req.welcome,
+                             **info, "created_at": _now(), "last_event_at": None, "last_error": None,
+                             "messages_total": 0})
+    sync_tunnel()
+    url, _ = _central(check=False)
+    return _public_channel(db_get("channels", cid), _tenant_id(), url)
+
+
+@app.put("/api/admin/channels/{channel_id}")
+def update_channel(channel_id: str, req: ChannelIn):
+    _validate_channel_bot(req.bot_id)
+    with _db_lock:
+        row = db_get("channels", channel_id)
+        if not row:
+            raise HTTPException(404, "ไม่พบช่องทางนี้")
+        if (req.access_token or "").strip():
+            row["access_token"] = _enc(req.access_token.strip())
+            row.update(_fetch_line_info(req.access_token.strip()))
+        if (req.channel_secret or "").strip():
+            row["channel_secret"] = _enc(req.channel_secret.strip())
+        row.update({"bot_id": req.bot_id, "enabled": req.enabled, "welcome": req.welcome})
+        db_put("channels", channel_id, row)
+    url, _ = _central(check=False)
+    return _public_channel(row, _tenant_id(), url)
+
+
+@app.delete("/api/admin/channels/{channel_id}")
+def delete_channel(channel_id: str):
+    if not db_get("channels", channel_id):
+        raise HTTPException(404, "ไม่พบช่องทางนี้")
+    db_delete("channels", channel_id)
+    sync_tunnel()
+    return {"message": "ลบช่องทางแล้ว"}
+
+
+@app.post("/api/admin/channels/{channel_id}/test")
+def test_channel(channel_id: str):
+    """ตรวจ access token กับ LINE + สถานะท่อไป central (secret ตรวจได้เฉพาะตอนมีข้อความหรือกด Verify ใน LINE Developers)"""
+    row = _channel_secrets(db_get("channels", channel_id))
+    if not row:
+        raise HTTPException(404, "ไม่พบช่องทางนี้")
+    info = _fetch_line_info(row["access_token"])
+    with _db_lock:
+        cur = db_get("channels", channel_id)
+        if cur:
+            cur.update(info)
+            db_put("channels", channel_id, cur)
+    return {"ok": True, "account_name": info["account_name"], "tunnel": TUNNEL.state}
+
+
+if _CORS_ORIGINS:
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app.add_middleware(CORSMiddleware, allow_origins=_CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"],
+                       allow_credentials=True)
+
+
+# ══════════════════════════════════════════════
+# หน้าเว็บ (Next.js static export) — mount ท้ายสุดเพื่อไม่ทับ /api
+# ══════════════════════════════════════════════
+
+
+@app.get("/admin/knowledge", include_in_schema=False)
+@app.get("/admin/knowledge/", include_in_schema=False)
+def _kb_page_moved():
+    """ลิงก์เก่า/บุ๊กมาร์กของหน้าจัดการ KB (ย้ายมาอยู่ที่ /kb)"""
+    return RedirectResponse("/kb/", status_code=301)
+
+
+if FRONTEND_DIR.exists():
+    app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+else:
+    @app.get("/")
+    def _no_frontend():
+        return JSONResponse({"detail": f"ยังไม่ได้ build หน้าเว็บ ({FRONTEND_DIR}) — รัน npm ci && npm run build ใน node/frontend"}, status_code=503)
