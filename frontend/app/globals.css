@@ -2,6 +2,42 @@
 @tailwind components;
 @tailwind utilities;
 
+/* สีทั้งหมดของหน้าเว็บ — ร้านเปลี่ยนเองได้ใน <data>/custom/custom.css (ดู custom.css.example) */
+:root {
+  --brand-50: #fdf2f5;
+  --brand-100: #fbe4ea;
+  --brand-200: #f7cbd6;
+  --brand-300: #f0a3b6;
+  --brand-400: #e77592;
+  --brand-500: #df5876;
+  --brand-600: #d84a67;
+  --brand-700: #b43552;
+  --brand-800: #962e47;
+  --brand-900: #7e2a40;
+  --accent-50: #faf8f7;
+  --accent-100: #f3efed;
+  --accent-200: #e7e1de;
+  --accent-300: #cdc4c0;
+  --accent-400: #a2958f;
+  --accent-500: #7b6e69;
+  --accent-600: #5f5450;
+  --accent-700: #48403d;
+  --accent-800: #2c2625;
+  --accent-900: #171313;
+  --ink: #151112;
+  --ink-soft: #231c1e;
+  --brand-grad-from: #d84a67;
+  --brand-grad-mid: #e3627f;
+  --brand-grad-to: #e87b73;
+  --ink-grad-from: #3a2630;
+  --ink-grad-mid: #171214;
+  --ink-grad-to: #0e0b0c;
+  --page-bg: #f5f1ef;
+  --page-bg-from: #faf8f7;
+  --page-bg-to: #f0ebe8;
+}
+
+
 html,
 body {
   height: 100%;
@@ -10,11 +46,11 @@ body {
 /* พื้นหลังซ้อนชั้น: เทาอุ่นไล่เฉด + แสงชมพูจาง ๆ มุมขวาบน + เงาเทามุมซ้ายล่าง */
 body {
   @apply text-accent-900 antialiased;
-  background-color: #f5f1ef;
+  background-color: var(--page-bg);
   background-image:
-    radial-gradient(1100px 560px at 88% -12%, rgb(227 98 127 / 0.09), transparent 62%),
+    radial-gradient(1100px 560px at 88% -12%, color-mix(in srgb, var(--brand-grad-mid) 9%, transparent), transparent 62%),
     radial-gradient(900px 520px at -8% 108%, rgb(123 110 105 / 0.12), transparent 60%),
-    linear-gradient(180deg, #faf8f7 0%, #f0ebe8 100%);
+    linear-gradient(180deg, var(--page-bg-from) 0%, var(--page-bg-to) 100%);
   background-attachment: fixed;
 }
 

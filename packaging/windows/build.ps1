@@ -26,7 +26,10 @@ if (-not (Test-Path $zip)) {
 if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne $qdrantSha256) {
     Remove-Item $zip; throw "SHA256 ของ Qdrant ไม่ตรง — ไม่ใช้ไฟล์นี้"
 }
-Expand-Archive $zip -DestinationPath "$cache\qdrant-$qdrantVersion" -Force
+# แตกไฟล์เฉพาะครั้งแรก — ถ้า qdrant.exe ในแคชกำลังรันอยู่ (เช่นใช้ทดสอบ) เขียนทับไม่ได้
+if (-not (Test-Path "$cache\qdrant-$qdrantVersion\qdrant.exe")) {
+    Expand-Archive $zip -DestinationPath "$cache\qdrant-$qdrantVersion" -Force
+}
 
 & $Python -m venv $venv
 & "$venv\Scripts\python.exe" -m pip install -q -r "$node\requirements.txt" -r "$PSScriptRoot\requirements.txt" pyinstaller
@@ -39,7 +42,7 @@ Expand-Archive $zip -DestinationPath "$cache\qdrant-$qdrantVersion" -Force
     --add-data "$PSScriptRoot\1n9.ico;." `
     --hidden-import qdrant_runner `
     --collect-submodules uvicorn --collect-submodules websockets `
-    --hidden-import app --hidden-import tunnel_client --hidden-import line_channel `
+    --hidden-import app --hidden-import tunnel_client --hidden-import line_channel --hidden-import local_ai `
     --exclude-module tkinter --exclude-module pytest `
     "$PSScriptRoot\launcher.py"
 

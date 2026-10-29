@@ -67,6 +67,16 @@ A ready-made Windows installer (it bundles the vector database) is available fro
 
 The first-run setup page asks for an admin password (user `admin`) as its first step; you can also preset it with `NODE_PASSWORD`. Once setup is done the chat page `/` is public, while `/admin` and its APIs require sign-in (the scope is adjustable with `NODE_AUTH_SCOPE`). Repeated failed sign-ins are slowed down.
 
+## Customize the look
+
+Everything lives in `data/custom/` (on Windows `%LOCALAPPDATA%\1n9\data\custom`), is created on first start with a `README.txt` and a `custom.css.example`, and survives updates. Drop files in and refresh the browser; no restart and no build:
+
+- `logo.png` / `logo.svg` / `logo.webp` / `logo.jpg` replaces the logo on every page; `favicon.ico` / `.png` / `.svg` sets the tab icon.
+- `custom.css` is added to every page. All colors are CSS variables (`--brand-50` … `--brand-900`, `--accent-*`, `--page-bg`, …); the example derives every shade from one `--my-brand` line.
+- Layout: the main parts of the chat page carry stable `data-ui` names (`chat-header`, `chat-messages`, `message`, `message-bubble`, `chat-composer`, …, listed in the example) so CSS can hide, move or reorder them without depending on generated class names.
+- `custom.js` is added to the chat pages only (analytics, pixels, widgets). It stays off admin pages, because a third-party script there could read admin data; set `NODE_CUSTOM_JS_ADMIN=1` if you really need it.
+- Full redesign: build the web UI yourself from `frontend/` (Next.js) and put the `out/` folder at `data/custom/web/`. If `data/custom/web/index.html` exists, the node serves that UI instead of the bundled one (restart needed). Updates do not touch it, so you rebuild from the new source to get new screens.
+
 ## Good to know
 
 - **Always back up `data/node.db` together with `data/secret.key`.** Without the key file, the AI keys stored in Settings cannot be decrypted and you must enter them again (knowledge bases and bots are kept).

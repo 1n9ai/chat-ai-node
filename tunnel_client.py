@@ -45,6 +45,7 @@ class TunnelClient:
         self._target = target
         self._verify = verify
         self._thread: threading.Thread | None = None
+        self._start_lock = threading.Lock()
         self._stop = threading.Event()
         self._ws = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -52,11 +53,14 @@ class TunnelClient:
 
     # ── ควบคุม ──
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=lambda: asyncio.run(self._run()), name="central-tunnel", daemon=True)
-        self._thread.start()
+        # ล็อกไว้: คำขอหลายตัวเรียก start() พร้อมกันได้ (ทุกครั้งที่สร้าง credentials) ถ้าไม่ล็อกจะได้ท่อสองเส้น
+        # จาก license เดียวกัน แล้ว central ตัดเส้นเก่าตามกติกา "ล่าสุดชนะ" สลับกันไม่จบ — คำขอที่วิ่งในท่อค้างจนหมดเวลา
+        with self._start_lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(target=lambda: asyncio.run(self._run()), name="central-tunnel", daemon=True)
+            self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()

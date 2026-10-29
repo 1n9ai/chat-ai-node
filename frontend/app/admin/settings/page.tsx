@@ -56,6 +56,7 @@ import type {
   VectorType,
 } from "@/lib/types";
 import { LicenseKeyReveal } from "@/components/LicenseKeyReveal";
+import { LocalAi } from "@/components/LocalAi";
 import { useI18n } from "@/lib/i18n";
 
 type T = ReturnType<typeof useI18n>["t"];
@@ -756,6 +757,7 @@ export default function SettingsPage() {
 
   const [check, setCheck] = useState<CheckResult | null>(null);
   const [checking, setChecking] = useState(false);
+  const [showLocal, setShowLocal] = useState(false);
 
   const load = useCallback(async () => {
     const res = await getSettings();
@@ -875,6 +877,15 @@ export default function SettingsPage() {
             >
               <Plus size={18} /> {t("settings.conn.add")}
             </button>
+          </div>
+          <div className="mt-4">
+            {showLocal ? (
+              <LocalAi onDone={load} />
+            ) : (
+              <button type="button" onClick={() => setShowLocal(true)} className="text-sm font-medium text-brand-700 hover:underline">
+                {t("local_ai.title")}
+              </button>
+            )}
           </div>
         </Panel>
 

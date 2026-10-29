@@ -113,7 +113,7 @@ export function ChatInput({
   }
 
   return (
-    <div className="flex flex-col gap-2 bg-white p-3">
+    <div data-ui="chat-input" className="flex flex-col gap-2 bg-white p-3">
       {(file || fileError) && (
         <div className="flex items-center gap-2 text-xs">
           {file && (

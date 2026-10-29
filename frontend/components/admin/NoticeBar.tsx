@@ -14,6 +14,7 @@ const ALERT_LINK: Record<AdminAlert["code"], { href: string; label: string }> = 
   ai_key: { href: "/admin/settings/", label: "notice.alerts.open_settings" },
   line_error: { href: "/admin/channels/", label: "notice.alerts.open_channels" },
   task_limit_missed: { href: "/admin/", label: "notice.renew" },
+  local_ai: { href: "/admin/settings/", label: "notice.alerts.add_key" },
 };
 
 // แถบแจ้งเตือนบนทุกหน้าหลังบ้าน:
@@ -121,7 +122,7 @@ export function NoticeBar() {
           key={`${a.code}-${a.name}-${i}`}
           role="alert"
           className={`mb-3 flex flex-wrap items-center gap-3 rounded-2xl px-4 py-3 text-sm ring-1 ring-inset ${
-            a.code === "source_held" ? "bg-amber-50 text-amber-900 ring-amber-200" : "bg-rose-50 text-rose-900 ring-rose-200"
+            a.code === "local_ai" ? "bg-sky-50 text-sky-900 ring-sky-200" : a.code === "source_held" ? "bg-amber-50 text-amber-900 ring-amber-200" : "bg-rose-50 text-rose-900 ring-rose-200"
           }`}
         >
           <AlertTriangle size={16} className="shrink-0" />

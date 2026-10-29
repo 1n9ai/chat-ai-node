@@ -3,7 +3,7 @@
 // คอมเมนต์ภาษาไทยได้ (ตัดคอมเมนต์ออกก่อนตรวจ)
 import { readFileSync } from "node:fs";
 
-const MIGRATED = ["app/setup/page.tsx", "lib/i18n.tsx", "app/admin/channels/page.tsx", "components/admin/NoticeBar.tsx", "components/kb/IngestProgress.tsx", "app/admin/settings/page.tsx", "components/skills/SkillSetDetail.tsx"];
+const MIGRATED = ["app/setup/page.tsx", "lib/i18n.tsx", "app/admin/channels/page.tsx", "components/admin/NoticeBar.tsx", "components/kb/IngestProgress.tsx", "app/admin/settings/page.tsx", "components/skills/SkillSetDetail.tsx", "components/LocalAi.tsx"];
 const SCRIPT = /[฀-๿぀-ヿ一-鿿]/;
 const LABELS_OK = /label: "(ไทย|English|日本語|中文)"/; // ชื่อภาษาในตัวเลือกภาษา แสดงเป็นภาษาของมันเองโดยตั้งใจ
 

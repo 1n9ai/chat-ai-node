@@ -47,7 +47,7 @@ function EmptyState({ bot, onPick, disabled }: { bot: Chatbot; onPick: (q: strin
   const Icon = botIcon(bot.welcome_icon);
   const message = bot.welcome_message || bot.description;
   return (
-    <div className="flex flex-1 flex-col items-center justify-center px-4 py-10 text-center">
+    <div data-ui="chat-welcome" className="flex flex-1 flex-col items-center justify-center px-4 py-10 text-center">
       {bot.welcome_label && <p className="eyebrow mb-5">{bot.welcome_label}</p>}
       <span className="relative mb-5">
         <span className="absolute -inset-10 rounded-full bg-gradient-to-br from-brand-300/60 via-brand-200/25 to-violet-200/20 blur-2xl" />
@@ -55,10 +55,10 @@ function EmptyState({ bot, onPick, disabled }: { bot: Chatbot; onPick: (q: strin
           <Icon size={22} />
         </span>
       </span>
-      <h1 className="title-grad text-2xl font-semibold tracking-tight">{bot.name}</h1>
-      {message && <p className="mt-2 max-w-md whitespace-pre-line text-sm font-light leading-relaxed text-accent-500">{message}</p>}
+      <h1 data-ui="welcome-title" className="title-grad text-2xl font-semibold tracking-tight">{bot.name}</h1>
+      {message && <p data-ui="welcome-message" className="mt-2 max-w-md whitespace-pre-line text-sm font-light leading-relaxed text-accent-500">{message}</p>}
       {(bot.line_oa ?? []).length > 0 && (
-        <div className="mt-4 flex flex-wrap justify-center gap-2">
+        <div data-ui="line-buttons" className="mt-4 flex flex-wrap justify-center gap-2">
           {(bot.line_oa ?? []).map((o) => (
             <a
               key={o.basic_id}
@@ -73,7 +73,7 @@ function EmptyState({ bot, onPick, disabled }: { bot: Chatbot; onPick: (q: strin
         </div>
       )}
       {tags.length > 0 && (
-        <div className="mt-6 grid w-full max-w-xl gap-2 sm:grid-cols-2">
+        <div data-ui="quick-questions" className="mt-6 grid w-full max-w-xl gap-2 sm:grid-cols-2">
           {tags.map((t, i) => (
             <button
               key={i}
@@ -163,13 +163,14 @@ function ChatApp() {
   }
 
   return (
-    <div className="flex h-[100dvh] flex-col">
-      <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-white/70 bg-white/70 px-4 backdrop-blur-xl sm:px-6">
+    <div data-ui="chat-page" className="flex h-[100dvh] flex-col">
+      <header data-ui="chat-header" className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-white/70 bg-white/70 px-4 backdrop-blur-xl sm:px-6">
         <div className="flex min-w-0 items-center gap-2.5">
           <AppMark size={32} />
           <BotPicker bots={bots} activeId={activeBotId} onSelect={setActiveBotId} />
         </div>
         <Link
+          data-ui="admin-link"
           href="/admin/"
           aria-label="หลังบ้าน"
           title="หลังบ้าน"
@@ -179,7 +180,7 @@ function ChatApp() {
         </Link>
       </header>
 
-      <div className="scrollbar-thin flex min-h-0 flex-1 flex-col overflow-y-auto">
+      <div data-ui="chat-body" className="scrollbar-thin flex min-h-0 flex-1 flex-col overflow-y-auto">
         <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col px-4 py-6">
           {loading ? (
             <div className="m-auto flex items-center gap-2 text-sm text-accent-400"><Loader2 size={16} className="animate-spin" /> กำลังโหลด...</div>
@@ -195,7 +196,7 @@ function ChatApp() {
           ) : messages.length === 0 ? (
             <EmptyState bot={activeBot} onPick={(q) => handleSend(q, null)} disabled={isTyping} />
           ) : (
-            <div className="flex flex-col gap-5">
+            <div data-ui="chat-messages" className="flex flex-col gap-5">
               {messages.map((m) => (
                 <ChatBubble key={m.id} message={m} />
               ))}
@@ -206,10 +207,10 @@ function ChatApp() {
       </div>
 
       {activeBot && (
-        <div className="shrink-0 px-3 pb-3 sm:px-4 sm:pb-5">
+        <div data-ui="chat-composer" className="shrink-0 px-3 pb-3 sm:px-4 sm:pb-5">
           <div className="surface mx-auto w-full max-w-3xl overflow-hidden">
             {messages.length > 0 && activeBot.quick_chat_enabled && activeBot.quick_chat_tags.length > 0 && (
-              <div className="flex gap-1.5 overflow-x-auto px-4 pt-3">
+              <div data-ui="quick-chips" className="flex gap-1.5 overflow-x-auto px-4 pt-3">
                 {activeBot.quick_chat_tags.map((t, i) => (
                   <button
                     key={i}

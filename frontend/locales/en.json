@@ -50,7 +50,8 @@
       "pick_model": "Choose a model",
       "type_model": "Other (type a name)",
       "discover_first": "Enter the LLM's API key above first; the models will be listed for you",
-      "no_embedding_here": "No embedding models on this connection — untick the box below and use another one, or type a name"
+      "no_embedding_here": "No embedding models on this connection — untick the box below and use another one, or type a name",
+      "no_key": "No API key? Use local AI instead"
     },
     "password": {
       "title": "Admin password",
@@ -153,7 +154,9 @@
       "open_kb": "Open knowledge",
       "open_settings": "Go to settings",
       "open_channels": "View channels",
-      "task_limit_missed": "The LINE bot ‘{name}’ couldn't answer {count} message(s) today because today's free tasks ran out. Customers were told to try again tomorrow. Subscribe with the same key to answer every message."
+      "task_limit_missed": "The LINE bot ‘{name}’ couldn't answer {count} message(s) today because today's free tasks ran out. Customers were told to try again tomorrow. Subscribe with the same key to answer every message.",
+      "local_ai": "Using local AI — for faster, higher-quality answers, add an API key from a cloud AI provider",
+      "add_key": "Add API key"
     },
     "tasks": {
       "used": "Used {used} of {limit} free tasks today",
@@ -391,5 +394,30 @@
     "hide": "Hide password",
     "logout": "Sign out",
     "forgot": "Forgot the password? Reset it on the machine that runs this app."
+  },
+  "local_ai": {
+    "title": "Use local AI (no API key needed)",
+    "intro": "This installs Ollama and AI models of about {gb} GB on this computer. No data is sent to an outside AI provider.",
+    "spec": "Recommended: 16 GB RAM and a dedicated graphics card (NVIDIA), or a Mac with an M-series chip",
+    "no_gpu": "⚠️ No dedicated graphics card found on this computer — each question may take about 1 minute, and questions that compare many items may take several minutes",
+    "quality": "💡 Local AI is good for getting started and for everyday questions. For the best answer quality, especially for analysis, comparisons or calculations over large amounts of data, we recommend an API key from a cloud AI provider — it answers faster and costs little per question",
+    "install": "Install local AI",
+    "use_key": "Use an API key instead",
+    "low_ram": "This computer has {ram} GB RAM (minimum {min} GB) — it may not run, or may be very slow",
+    "low_disk": "Only {free} GB free disk space (at least {min} GB needed) — free up space before installing",
+    "need_ollama": "Ollama can't be installed automatically on this kind of system — install Ollama yourself from ollama.com, then press again and the models will be downloaded and set up for you",
+    "ready": "Local AI is ready",
+    "step": {
+      "check": "Checking this computer…",
+      "download": "Downloading Ollama…",
+      "install": "Installing Ollama…",
+      "start": "Starting Ollama…",
+      "pull_llm": "Downloading the answer model…",
+      "pull_embedding": "Downloading the document search model…",
+      "configure": "Setting up…",
+      "done": "Done"
+    },
+    "error": "Install failed: {detail}",
+    "keep_open": "This takes several minutes depending on your internet speed. You can keep this page open, or close it and come back later"
   }
 }

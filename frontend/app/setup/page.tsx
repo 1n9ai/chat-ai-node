@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/Button";
 import { finishSetup, getSetup, saveLicenseKey, setupAi, setupPassword, startTrial, discoverModels, type DiscoveredModel, type SetupEndpoint, type SetupStatus } from "@/lib/api";
 import { I18nProvider, LOCALES, errorText, useI18n, type Locale } from "@/lib/i18n";
 import { AppMark } from "@/components/ui/AppMark";
+import { LocalAi } from "@/components/LocalAi";
 
 const STEPS = ["license", "ai", "password"] as const;
 type Step = (typeof STEPS)[number] | "finish";
@@ -232,6 +233,20 @@ function AiStep({ status, onBack, onDone }: { status: SetupStatus; onBack: () =>
   const embEff: Endpoint = embSame ? { ...llm, model: emb.model } : emb;
   const ok = (e: Endpoint) => !!(e.model.trim() && (e.api_key.trim() || e.base_url.trim()));
   const canSave = ok(llm) && ok(embEff) && (!useRerank || ok(rr));
+  const [local, setLocal] = useState(false);
+
+  if (local) {
+    return (
+      <Card icon={<KeyRound size={18} />} title={t("setup.ai.title")} desc={t("setup.ai.desc")}>
+        <LocalAi onUseKey={() => setLocal(false)} onDone={() => getSetup().then(onDone).catch(() => undefined)} />
+        <div className="flex justify-start">
+          <Button variant="ghost" onClick={onBack}>
+            {t("setup.back")}
+          </Button>
+        </div>
+      </Card>
+    );
+  }
 
   return (
     <Card icon={<KeyRound size={18} />} title={t("setup.ai.title")} desc={t("setup.ai.desc")}>
@@ -261,6 +276,9 @@ function AiStep({ status, onBack, onDone }: { status: SetupStatus; onBack: () =>
       )}
       <p className="text-xs leading-relaxed text-accent-400">{t("setup.ai.where_note")}</p>
       <p className="text-xs leading-relaxed text-accent-400">{t("setup.ai.privacy_note")}</p>
+      <button type="button" onClick={() => setLocal(true)} className="self-start text-sm font-medium text-brand-700 hover:underline">
+        {t("setup.ai.no_key")}
+      </button>
       <ErrorLine text={err} />
       <div className="flex justify-between gap-2">
         <Button variant="ghost" onClick={onBack}>

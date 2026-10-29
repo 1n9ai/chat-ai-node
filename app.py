@@ -36,6 +36,7 @@ from urllib.parse import quote, urlparse
 import httpx
 from tunnel_client import TunnelClient
 import line_channel
+import local_ai
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -122,7 +123,9 @@ _PUBLIC_API = (
 
 
 # หน้า login, ไฟล์หน้าเว็บที่ไม่มีข้อมูล และสถานะสาธารณะ (แค่ "ตั้งค่าครบหรือยัง") เปิดเสมอ
-_OPEN_PREFIXES = ("/login", "/api/auth/", "/api/public/", "/_next/", "/brand/", "/icon.png", "/apple-icon.png", "/favicon")
+# /custom/ = โลโก้/สี/สคริปต์ที่ร้านปรับเอง ต้องแสดงได้ตั้งแต่หน้า login
+_OPEN_PREFIXES = ("/login", "/api/auth/", "/api/public/", "/_next/", "/brand/", "/icon.png", "/apple-icon.png", "/favicon",
+                  "/custom/")
 
 
 def _needs_password(method: str, path: str) -> bool:
@@ -303,6 +306,155 @@ async def no_cache_html(request: Request, call_next):
     if not static_asset:
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return response
+
+
+# ══════════════════════════════════════════════
+# ปรับหน้าตาเอง — โฟลเดอร์ <data>/custom (อัปเดตโปรแกรมแล้วไม่หาย ไม่ต้อง build หน้าเว็บใหม่)
+# ══════════════════════════════════════════════
+# custom.css  → ใส่ทุกหน้า (สี ฟอนต์ ซ่อน/ย้ายส่วนต่าง ๆ) · logo.(svg|png|webp|jpg) → แทนโลโก้ทุกหน้า
+# favicon.(ico|png|svg) → ไอคอนแท็บ · custom.js → ใส่เฉพาะหน้าแชท (ไม่ใส่หลังบ้าน เพราะสคริปต์ภายนอกในหลังบ้าน
+# อ่านข้อมูล/สิทธิ์ผู้ดูแลได้) — เปิดให้หลังบ้านด้วย NODE_CUSTOM_JS_ADMIN=1
+CUSTOM_DIR = DATA_DIR / "custom"
+CUSTOM_JS_ON_ADMIN = os.environ.get("NODE_CUSTOM_JS_ADMIN", "").strip().lower() in ("1", "true", "yes")
+_CUSTOM_TYPES = {
+    ".css": "text/css", ".js": "text/javascript", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".svg": "image/svg+xml", ".webp": "image/webp", ".gif": "image/gif", ".ico": "image/x-icon",
+    ".woff2": "font/woff2", ".woff": "font/woff", ".ttf": "font/ttf",
+}
+_ADMIN_PAGE = re.compile(r"^/(admin|kb|setup|login)(/|$)")
+_CUSTOM_README = """ปรับหน้าตา 1n9 เอง / Customize how 1n9 looks
+==========================================
+
+วางไฟล์ในโฟลเดอร์นี้ แล้วกดรีเฟรชเบราว์เซอร์ — ไม่ต้องรีสตาร์ต ไม่ต้อง build อะไร อัปเดตโปรแกรมแล้วไฟล์ไม่หาย
+Put files in this folder and refresh the browser. No restart or build needed; updates keep them.
+
+  logo.png / logo.svg / logo.webp / logo.jpg   โลโก้ร้าน แทนโลโก้ทุกหน้า (สี่เหลี่ยมจัตุรัสดูดีสุด)
+                                              your logo on every page (square works best)
+  favicon.ico / favicon.png / favicon.svg      ไอคอนบนแท็บเบราว์เซอร์ / browser tab icon
+  custom.css                                   สี ฟอนต์ ซ่อนหรือย้ายส่วนต่าง ๆ — ใส่ทุกหน้า
+                                              colors, fonts, hide or move parts — every page
+  custom.js                                    สคริปต์ เช่น Analytics / Pixel / widget — ใส่เฉพาะหน้าแชท
+                                              scripts (analytics, pixels, widgets) — chat pages only
+  ไฟล์อื่น (รูป ฟอนต์)                          เรียกใช้ใน css ได้ที่ /custom/<ชื่อไฟล์>
+  other files (images, fonts)                 use them from css at /custom/<file name>
+
+เปลี่ยนสีหลัก: คัดลอก custom.css.example เป็น custom.css แล้วแก้ค่า --my-brand บรรทัดเดียว
+Change the main color: copy custom.css.example to custom.css and edit the one --my-brand line.
+
+custom.js ไม่ถูกใส่ในหน้าหลังบ้านเพื่อความปลอดภัย ถ้าต้องการจริงตั้ง NODE_CUSTOM_JS_ADMIN=1
+custom.js is kept off admin pages for safety; set NODE_CUSTOM_JS_ADMIN=1 if you really need it there.
+"""
+_CUSTOM_CSS_EXAMPLE = """/* คัดลอกไฟล์นี้เป็น custom.css แล้วแก้ --my-brand (สีหลัก) — เฉดอื่นคำนวณให้เอง
+   Copy this file to custom.css and change --my-brand (main color); the other shades follow it. */
+:root {
+  --my-brand: #2563eb;
+
+  --brand-50:  color-mix(in srgb, var(--my-brand) 6%, white);
+  --brand-100: color-mix(in srgb, var(--my-brand) 12%, white);
+  --brand-200: color-mix(in srgb, var(--my-brand) 25%, white);
+  --brand-300: color-mix(in srgb, var(--my-brand) 45%, white);
+  --brand-400: color-mix(in srgb, var(--my-brand) 70%, white);
+  --brand-500: color-mix(in srgb, var(--my-brand) 88%, white);
+  --brand-600: var(--my-brand);
+  --brand-700: color-mix(in srgb, var(--my-brand) 82%, black);
+  --brand-800: color-mix(in srgb, var(--my-brand) 68%, black);
+  --brand-900: color-mix(in srgb, var(--my-brand) 56%, black);
+
+  /* ไล่สีของปุ่มหลักและข้อความฝั่งผู้ใช้ / gradient of main buttons and user messages */
+  --brand-grad-from: var(--brand-600);
+  --brand-grad-mid:  var(--brand-500);
+  --brand-grad-to:   var(--brand-400);
+}
+
+/* พื้นหลังหน้าเว็บ / page background
+:root { --page-bg: #f4f7fb; --page-bg-from: #f8fafc; --page-bg-to: #eef2f7; } */
+
+/* สีเทาของตัวหนังสือ เส้น และพื้น ตั้งได้ --accent-50 ถึง --accent-900 / grays for text, lines, surfaces
+:root { --accent-900: #0f172a; --accent-500: #64748b; } */
+
+/* ตัวอย่างเปลี่ยนฟอนต์ / example: change the font
+body { font-family: "Sarabun", sans-serif; } */
+
+/* จัดวาง: ส่วนหลักของหน้ามีชื่อถาวร [data-ui="..."] ใช้ได้ทุกเวอร์ชัน
+   Layout: main parts carry stable names [data-ui="..."] that survive updates.
+   chat-page, chat-header, app-logo, bot-picker, admin-link, chat-body, chat-welcome, welcome-title,
+   welcome-message, line-buttons, quick-questions, chat-messages, message (data-role="user"|"assistant"),
+   message-avatar, message-bubble, chat-composer, quick-chips, chat-input
+
+[data-ui="admin-link"] { display: none; }                      ซ่อนปุ่มไปหลังบ้าน / hide the admin button
+[data-ui="message-avatar"] { display: none; }                  ซ่อนรูปผู้พูด / hide avatars
+[data-ui="chat-header"] { flex-direction: row-reverse; }       สลับซ้ายขวาแถบบน / swap header sides
+[data-ui="chat-messages"] { max-width: 56rem; margin: 0 auto; } ขยายความกว้างแชท / wider chat column */
+"""
+
+
+def ensure_custom_dir() -> None:
+    try:
+        CUSTOM_DIR.mkdir(parents=True, exist_ok=True)
+        for name, text in (("README.txt", _CUSTOM_README), ("custom.css.example", _CUSTOM_CSS_EXAMPLE)):
+            path = CUSTOM_DIR / name
+            if not path.exists():
+                path.write_text(text, encoding="utf-8")
+    except OSError:
+        pass  # ไม่มีโฟลเดอร์ปรับแต่งก็ใช้หน้าตาปกติได้
+
+
+def _custom_file(name: str) -> Path | None:
+    try:
+        path = (CUSTOM_DIR / name).resolve()
+        if path.is_relative_to(CUSTOM_DIR.resolve()) and path.is_file() and path.suffix.lower() in _CUSTOM_TYPES:
+            return path
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _first_custom(stem: str, exts: tuple[str, ...]) -> Path | None:
+    return next((p for p in (_custom_file(stem + e) for e in exts) if p), None)
+
+
+def _custom_url(path: Path) -> str:
+    return f"/custom/{path.name}?v={int(path.stat().st_mtime)}"
+
+
+@app.get("/custom/{name:path}")
+def custom_asset(name: str):
+    path = _custom_file(name)
+    if not path:
+        raise HTTPException(404, "not found")
+    return FileResponse(path, media_type=_CUSTOM_TYPES[path.suffix.lower()],
+                        headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/api/public/branding")
+def public_branding():
+    logo = _first_custom("logo", (".svg", ".png", ".webp", ".jpg", ".jpeg"))
+    return {"logo": _custom_url(logo) if logo else None}
+
+
+@app.middleware("http")
+async def inject_custom(request: Request, call_next):
+    """เติม custom.css / favicon / custom.js ลงหน้า HTML ที่ส่งออกไป (หน้าเว็บที่ build แล้วไม่ต้องแก้)"""
+    response = await call_next(request)
+    if request.method != "GET" or not response.headers.get("content-type", "").startswith("text/html"):
+        return response
+    head, tail = [], []
+    if css := _custom_file("custom.css"):
+        head.append(f'<link rel="stylesheet" href="{_custom_url(css)}">')
+    if icon := _first_custom("favicon", (".ico", ".png", ".svg")):
+        head.append(f'<link rel="icon" href="{_custom_url(icon)}">')
+    if (js := _custom_file("custom.js")) and (CUSTOM_JS_ON_ADMIN or not _ADMIN_PAGE.match(request.url.path)):
+        tail.append(f'<script src="{_custom_url(js)}" defer></script>')
+    if not head and not tail:
+        return response
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    html = body.decode("utf-8", errors="replace")
+    if head:
+        html = html.replace("</head>", "".join(head) + "</head>", 1)
+    if tail:
+        html = html.replace("</body>", "".join(tail) + "</body>", 1)
+    headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
+    return Response(html.encode("utf-8"), status_code=response.status_code, headers=headers)
 
 
 # ══════════════════════════════════════════════
@@ -1230,6 +1382,7 @@ def _startup():
     ensure_kb_embeddings()
     start_realtime_scheduler()
     sync_tunnel()
+    ensure_custom_dir()
     threading.Thread(target=_backfill_line_ids, name="line-id-backfill", daemon=True).start()
 
 
@@ -2905,6 +3058,11 @@ def admin_alerts():
                 continue
             alerts.append({"code": _AI_ERROR_KIND.get(m.group(1) if m else "", "line_error"),
                            "name": ch.get("account_name") or "", "detail": err[m.end():] if m else err})
+    st = load_settings()
+    _, llm = resolve_model(st, "llm")
+    prov = st["providers"].get((llm or {}).get("provider") or "") or {}
+    if prov.get("type") == "ollama" and _is_private_url(_endpoint(prov)[1]):
+        alerts.append({"code": "local_ai", "name": (llm or {}).get("model", "")})  # แนะนำ API key (ช้ากว่า cloud)
     return {"alerts": alerts}
 
 
@@ -3024,6 +3182,34 @@ def setup_ai(body: dict = Body(...)):
         _upsert_model(s, "rerank", provider(rr), rr[3])
     _write_settings(s)
     return {**setup_status(), "embedding_dim": dim}
+
+
+# ── AI ในเครื่อง (ไม่ต้องมี API key) ── ดู local_ai.py ─────
+
+def _configure_local_ai(base_url: str, llm: str, embedding: str, dim: int) -> None:
+    """เพิ่มการเชื่อมต่อ Ollama + 2 โมเดลลงคลัง — ตั้งเป็นค่าเริ่มต้นเฉพาะประเภทที่ยังไม่มีค่าเริ่มต้นที่ใช้ได้
+    (ลูกค้าที่ตั้ง cloud ไว้แล้วกดติดตั้งเพิ่ม ค่าเดิมไม่ถูกแทนที่ · embedding ที่ผูกกับ KB อยู่ก็ไม่ถูกเปลี่ยน)"""
+    s = json.loads(json.dumps(load_settings()))
+    before = {k: s["defaults"].get(k) for k in ("llm", "embedding")}
+    usable = setup_status(s)
+    pid = _upsert_provider(s, "Ollama (local)", "ollama", base_url, "")
+    _upsert_model(s, "llm", pid, llm)
+    _upsert_model(s, "embedding", pid, embedding, dim)
+    for kind, has in (("llm", usable["has_llm"]), ("embedding", usable["has_embedding"])):
+        if has and before[kind] in s["registry"]:
+            s["defaults"][kind] = before[kind]
+    _write_settings(s)
+    sync_tunnel()
+
+
+@app.get("/api/admin/local-ai")
+def local_ai_status():
+    return {**local_ai.status(), "hardware": local_ai.hardware(DATA_DIR)}
+
+
+@app.post("/api/admin/local-ai/install")
+def local_ai_install():
+    return {"job": local_ai.start(_configure_local_ai)}
 
 
 @app.post("/api/admin/setup/password")
@@ -3247,6 +3433,12 @@ def _kb_page_moved():
     """ลิงก์เก่า/บุ๊กมาร์กของหน้าจัดการ KB (ย้ายมาอยู่ที่ /kb)"""
     return RedirectResponse("/kb/", status_code=301)
 
+
+# หน้าเว็บที่ร้าน build เองจาก source (จัดวางใหม่ทั้งหน้า) วางที่ <data>/custom/web — มี index.html เมื่อไหร่ใช้ตัวนั้นแทน
+# อัปเดตโปรแกรมไม่ทับ (แต่ก็ไม่ได้หน้าใหม่จากเราจนกว่าร้านจะ build จาก source รุ่นใหม่เอง)
+if (CUSTOM_DIR / "web" / "index.html").is_file():
+    FRONTEND_DIR = CUSTOM_DIR / "web"
+    print(f"[custom] ใช้หน้าเว็บของร้านที่ {FRONTEND_DIR}")
 
 if FRONTEND_DIR.exists():
     app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

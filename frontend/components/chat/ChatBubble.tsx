@@ -6,8 +6,9 @@ export function ChatBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
 
   return (
-    <div className={`flex items-start gap-2.5 ${isUser ? "flex-row-reverse" : ""}`}>
+    <div data-ui="message" data-role={isUser ? "user" : "assistant"} className={`flex items-start gap-2.5 ${isUser ? "flex-row-reverse" : ""}`}>
       <div
+        data-ui="message-avatar"
         className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full ${
           isUser ? "bg-accent-200 text-accent-700" : "bg-ink bg-ink-grad text-brand-300 shadow-ink"
         }`}
@@ -30,6 +31,7 @@ export function ChatBubble({ message }: { message: ChatMessage }) {
           <span className="italic text-[11px] text-slate-400">{message.status}</span>
         )}
         <div
+          data-ui="message-bubble"
           className={`whitespace-pre-wrap rounded-2xl px-4 py-2.5 text-sm leading-relaxed shadow-soft ${
             isUser ? "rounded-tr-sm bg-brand-600 bg-brand-grad text-white shadow-brand" : "rounded-tl-sm bg-white text-accent-800 ring-1 ring-accent-200/60"
           } ${message.pending ? "italic text-slate-400" : ""}`}

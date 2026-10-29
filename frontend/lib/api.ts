@@ -397,7 +397,7 @@ export type Notice = { code: "beta_ending" | "beta_ended"; ends_at?: string };
 export type TaskStatus = { used: number; limit: number | null; unlimited_until: string | null; after_limit: number | null; resets_at: string };
 export const getNotice = () => request<{ notice: Notice | null; tasks?: TaskStatus | null }>("/api/admin/notice");
 export type AdminAlert = {
-  code: "source_held" | "source_error" | "ai_quota" | "ai_key" | "line_error" | "task_limit_missed";
+  code: "source_held" | "source_error" | "ai_quota" | "ai_key" | "line_error" | "task_limit_missed" | "local_ai";
   name: string;
   detail?: string;
   count?: number;
@@ -416,6 +416,37 @@ export const setupAi = (body: { llm: SetupEndpoint; embedding: SetupEndpoint; re
 export const setupPassword = (password: string) =>
   request<SetupStatus>("/api/admin/setup/password", { method: "POST", body: JSON.stringify({ password }) });
 export const finishSetup = () => request<SetupStatus>("/api/admin/setup/finish", { method: "POST" });
+
+// ── AI ในเครื่อง (Ollama) ──────────────────────────────
+export type LocalAiJob = {
+  state: "idle" | "running" | "done" | "error";
+  step?: "check" | "download" | "install" | "start" | "pull_llm" | "pull_embedding" | "configure" | "done";
+  progress?: number | null;
+  error_code?: string;
+  error?: string;
+};
+export type LocalAiStatus = {
+  ollama_running: boolean;
+  llm_ready: boolean;
+  embedding_ready: boolean;
+  llm_model: string;
+  embedding_model: string;
+  job: LocalAiJob;
+  hardware: {
+    os: string;
+    ram_gb: number | null;
+    disk_free_gb: number | null;
+    gpus: string[];
+    gpu: boolean;
+    min_ram_gb: number;
+    rec_ram_gb: number;
+    min_disk_gb: number;
+    download_gb: number;
+    can_install_ollama: boolean;
+  };
+};
+export const getLocalAi = () => request<LocalAiStatus>("/api/admin/local-ai");
+export const installLocalAi = () => request<{ job: LocalAiJob }>("/api/admin/local-ai/install", { method: "POST" });
 
 
 // ── ช่องทางสนทนา (LINE) ─────────────────────────────────
@@ -458,5 +489,7 @@ export const login = (username: string, password: string) =>
   request<{ ok: true }>("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
 export const logout = () => request<{ ok: true }>("/api/auth/logout", { method: "POST" });
 export const getPublicStatus = () => request<{ configured: boolean }>("/api/public/status");
+// โลโก้ที่ร้านวางเองใน <data>/custom (ไม่มี = ใช้ไอคอนเดิม)
+export const getBranding = () => request<{ logo: string | null }>("/api/public/branding");
 
 export const getLicenseKey = () => request<{ license_key: string }>("/api/admin/license/key");
